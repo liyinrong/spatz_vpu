@@ -324,8 +324,12 @@ module spatz_vfu
         vl_d = vl_q + nr_elem_word;
     end
 
-    // An instruction finished execution
-    if ((result_tag.last && &(result_valid | ~pending_results) && (reduction_state_q inside {Reduction_NormalExecution, Reduction_Wait} || ! result_tag.reduction)) || reduction_done) begin
+    // An instruction finished execution. result_ready makes the response a
+    // single-cycle pulse aligned with consumption: result_valid holds until
+    // the result is accepted, so without it an unconsumed result re-emits a
+    // response every stalled cycle (duplicate GPR writeback, repeated
+    // scoreboard clear).
+    if ((result_tag.last && &(result_valid | ~pending_results) && result_ready && (reduction_state_q inside {Reduction_NormalExecution, Reduction_Wait} || ! result_tag.reduction)) || reduction_done) begin
       vfu_rsp_o.id      = result_tag.id;
       vfu_rsp_o.rd      = result_tag.vd_addr[GPRWidth-1:0];
       vfu_rsp_o.wb      = result_tag.wb;
