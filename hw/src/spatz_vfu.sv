@@ -232,6 +232,15 @@ module spatz_vfu
   logic [N_FU*ELENB-1:0] result_valid;
   logic                  result_ready;
 
+  // Non-reduction results stay drainable in every reduction state, keyed off
+  // the retiring result's own tag (never the incoming request). Mirrors the
+  // NormalExecution readiness, including the comparison early-consume.
+  logic                  normal_result_ready;
+
+  assign normal_result_ready = !result_tag.reduction && &(result_valid | ~pending_results) &&
+                               ((result_tag.wb && vfu_rsp_ready_i) || vrf_wvalid_i ||
+                                (result_tag.is_cmp && !result_tag.last));
+
   // it represents the VRF word index
   logic [$clog2(NrWordsPerVector):0] word_idx_d, word_idx_q;
   `FF(word_idx_q, word_idx_d, '0)
@@ -713,8 +722,9 @@ module spatz_vfu
     // Did we issue a word to the FUs?
     word_issued = 1'b0;
 
-    // Are we ready to accept a result?
-    result_ready = 1'b0;
+    // Drain non-reduction results even inside the reduction FSM; the
+    // reduction states below override this for their own results only.
+    result_ready = normal_result_ready;
 
     // Reduction did not finish
     reduction_done = 1'b0;
@@ -802,9 +812,7 @@ module spatz_vfu
       end
 
       Reduction_Wait: begin
-        // Are we ready to accept a result?
-        result_ready = &(result_valid | ~pending_results) && ((result_tag.wb && vfu_rsp_ready_i) || vrf_wvalid_i);
-
+        // Non-reduction results drain via the default normal_result_ready.
         if (!is_fpu_busy)
           reduction_state_d = Reduction_Init;
       end
@@ -880,8 +888,11 @@ module spatz_vfu
         `ifdef SPATZ_VFU_REDUCTION_STUB
           reduction_d = '0;
         `else
-          // Maintain the input operand or set to '0 for the inputs until valid results arrive
-          reduction_d[0] = result_valid ? result : spatz_req.op inside {VFMINMAX, VAND, VOR, VMAX, VMAXU, VMIN, VMINU} ? reduction_q[0] : '0;
+          // Maintain the input operand or set to '0 for the inputs until valid results arrive.
+          // Only the reduction's own results may feed the accumulator; a
+          // straggler from the previous instruction drains via the default
+          // result_ready and must not be latched here.
+          reduction_d[0] = (result_valid && result_tag.reduction) ? result : spatz_req.op inside {VFMINMAX, VAND, VOR, VMAX, VMAXU, VMIN, VMINU} ? reduction_q[0] : '0;
           if ((N_IPU>0) && ~is_fpu_insn) begin
             // If IPU is used and if the DLEN < VRF word size, select the chunk
             reduction_d[1] = (VRFWordWidth==N_IPU*ELEN) ? $unsigned(reduction_vector_data) :
@@ -896,7 +907,7 @@ module spatz_vfu
           reduction_operand_ready_d = 1'b1;
           reduction_pointer_d = reduction_pointer_q + 1;
           word_issued = is_fpu_insn ? 1'b1 : (VRFWordWidth==ELEN*N_IPU) ? 1'b1 : !(|pnt) ? 1'b1 : 1'b0;
-          if (result_valid[0]) begin
+          if (result_valid[0] && result_tag.reduction) begin
             result_ready = 1'b1;
           end
           if (reduction_pointer_q == fill_cnt) begin
@@ -915,13 +926,13 @@ module spatz_vfu
         `ifdef SPATZ_VFU_REDUCTION_STUB
           reduction_d = '0;
         `else
-          reduction_d[0] = result_valid ? $unsigned(result) : reduction_q[0];
+          reduction_d[0] = (result_valid && result_tag.reduction) ? $unsigned(result) : reduction_q[0];
           reduction_d[1] = result_buf_valid_q ? $unsigned(result_buf_q) :  reduction_q[1];
         `endif
         lat_count_d = result_valid[0] ? '0 : lat_count_q + 1;
 
         // verilator lint_on SELRANGE
-        if (~result_buf_valid_q & result_valid[0]) begin
+        if (~result_buf_valid_q & result_valid[0] & result_tag.reduction) begin
           // First result is written into a buffer and its tag
           result_buf_valid_d = 1'b1;
           result_buf_d = result;
@@ -930,7 +941,7 @@ module spatz_vfu
         end
 
         // verilator lint_on SELRANGE
-        else if (result_buf_valid_q & result_valid[0]) begin
+        else if (result_buf_valid_q & result_valid[0] & result_tag.reduction) begin
           // If there is an existing result in buffer and one from FU, initiate a reduction
 
           // Trigger a request
@@ -981,15 +992,15 @@ module spatz_vfu
         `endif
 
         // verilator lint_on SELRANGE
-        if (result_valid[0] || result_buf_valid_q) begin
+        if ((result_valid[0] && result_tag.reduction) || result_buf_valid_q) begin
             // Trigger a request
             reduction_operand_ready_d = 1'b1;
 
             // Bump pointer
             reduction_pointer_d = reduction_pointer_q + 1;
 
-            // Acknowledge result
-            result_ready = result_valid[0];
+            // Acknowledge (only the reduction's own) result
+            result_ready = result_valid[0] && result_tag.reduction;
             result_buf_valid_d = 1'b0;
 
             // Update shift amnt
@@ -1022,7 +1033,7 @@ module spatz_vfu
         `endif
 
         // verilator lint_on SELRANGE
-        if (result_valid[0] || result_buf_valid_q) begin
+        if ((result_valid[0] && result_tag.reduction) || result_buf_valid_q) begin
 
             result_buf_valid_d = 1'b0;
 
@@ -1032,8 +1043,8 @@ module spatz_vfu
             // Bump pointer
             reduction_pointer_d = reduction_pointer_q + 1;
 
-            // Acknowledge result
-            result_ready = result_valid[0];
+            // Acknowledge (only the reduction's own) result
+            result_ready = result_valid[0] && result_tag.reduction;
 
             // Update shift amnt
             shift_amnt_d = shift_amnt_q << 1;
@@ -1048,8 +1059,9 @@ module spatz_vfu
       end
 
       Reduction_WriteBack: begin
-        // Acknowledge result
-        if (vrf_wvalid_i) begin
+        // Acknowledge result (only the reduction's own; stragglers drain via
+        // the default normal_result_ready)
+        if (vrf_wvalid_i && ((result_valid[0] && result_tag.reduction) || result_buf_valid_q)) begin
           result_ready = result_valid[0];
           result_buf_valid_d = 1'b0;
           result_buf_d = '0;
@@ -1179,7 +1191,7 @@ module spatz_vfu
     end
 
     // Reduction finished execution
-    if (reduction_state_q == Reduction_WriteBack && (result_valid[0] || result_buf_valid_q)) begin
+    if (reduction_state_q == Reduction_WriteBack && ((result_valid[0] && result_tag.reduction) || result_buf_valid_q)) begin
       vreg_we = 1'b1;
     end
   end : operand_req_proc
