@@ -165,32 +165,76 @@ module spatz_vlsu
   `FF(state_q, state_d, VLSU_RunningLoad)
 
 
-  id_t [NrMemPorts-1:0] store_count_q;
-  id_t [NrMemPorts-1:0] store_count_d;
+  // Store requests are not allocated in the load ROB, so their outstanding
+  // count is not bounded by the load-ID width. Up to
+  // NrParallelInstructions vector stores can be in flight, and an e8,m8
+  // strided/indexed store can emit MAXVL one-byte requests across the ports.
+  localparam int unsigned MaxStoreRequestsPerPort =
+      NrParallelInstructions * ((MAXVL + NrMemPorts - 1) / NrMemPorts);
+  localparam int unsigned StoreCountWidth = idx_width(MaxStoreRequestsPerPort + 1);
+  typedef logic [StoreCountWidth-1:0] store_count_t;
+
+  store_count_t [NrMemPorts-1:0] store_count_q;
+  store_count_t [NrMemPorts-1:0] store_count_d;
+  logic         [NrMemPorts-1:0] store_req_fire;
+  logic         [NrMemPorts-1:0] store_rsp_fire;
+  spatz_mem_req_t [NrMemPorts-1:0] spatz_mem_req;
+  logic           [NrMemPorts-1:0] spatz_mem_req_valid;
+  logic           [NrMemPorts-1:0] spatz_mem_req_ready;
 
   for (genvar port = 0; port < NrMemPorts; port++) begin: gen_store_count_q
     `FF(store_count_q[port], store_count_d[port], '0)
   end: gen_store_count_q
 
   always_comb begin: proc_store_count
-    // Maintain state
     store_count_d = store_count_q;
 
     for (int port = 0; port < NrMemPorts; port++) begin
-      if (spatz_mem_req_o[port].write && spatz_mem_req_valid_o[port] && spatz_mem_req_ready_i[port])
-        // Did we send a store?
-        store_count_d[port]++;
-
-      // Did we get the ack of a store?
-  `ifdef MEMPOOL_SPATZ
-      if (store_count_q[port] != '0 && spatz_mem_rsp_valid_i[port] && spatz_mem_rsp_i[port].write)
-        store_count_d[port]--;
-  `else
-      if (store_count_q[port] != '0 && spatz_mem_rsp_valid_i[port])
-        store_count_d[port]--;
-  `endif
+      unique case ({store_req_fire[port], store_rsp_fire[port]})
+        2'b10: store_count_d[port] = store_count_q[port] + 1'b1;
+        2'b01: begin
+          if (store_count_q[port] != '0)
+            store_count_d[port] = store_count_q[port] - 1'b1;
+        end
+        default:;
+      endcase
     end
   end: proc_store_count
+
+  for (genvar port = 0; port < NrMemPorts; port++) begin: gen_store_handshake
+    // Count a request as soon as it enters the output spill register. This
+    // includes buffered requests when the downstream TCDM port is stalled.
+    assign store_req_fire[port] = spatz_mem_req[port].write &&
+                                  spatz_mem_req_valid[port] &&
+                                  spatz_mem_req_ready[port];
+`ifdef MEMPOOL_SPATZ
+    assign store_rsp_fire[port] = spatz_mem_rsp_valid_i[port] &&
+                                  spatz_mem_rsp_i[port].write;
+`else
+    // Generic HCI responses do not carry a write flag. Preserve the original
+    // assumption that loads and stores do not overlap on a port.
+    assign store_rsp_fire[port] = spatz_mem_rsp_valid_i[port] &&
+                                  (store_count_q[port] != '0);
+`endif
+  end: gen_store_handshake
+
+  logic stores_drained;
+  assign stores_drained = !(|store_count_q);
+
+`ifndef SYNTHESIS
+  for (genvar port = 0; port < NrMemPorts; port++) begin: gen_store_count_assertions
+    always_ff @(posedge clk_i) begin
+      if (rst_ni) begin
+        assert (!(store_rsp_fire[port] && !store_req_fire[port] &&
+                  (store_count_q[port] == '0)))
+          else $error("Spatz store response arrived with no outstanding request");
+        assert (!(store_req_fire[port] && !store_rsp_fire[port] &&
+                  (store_count_q[port] == store_count_t'(MaxStoreRequestsPerPort))))
+          else $error("Spatz outstanding-store counter overflow");
+      end
+    end
+  end: gen_store_count_assertions
+`endif
 
   //////////////////////
   //  Reorder Buffer  //
@@ -547,10 +591,13 @@ module spatz_vlsu
   // Did we finish an instruction?
   logic vlsu_finished_req;
 
-  // Memory requests
-  spatz_mem_req_t [NrMemPorts-1:0] spatz_mem_req;
-  logic           [NrMemPorts-1:0] spatz_mem_req_valid;
-  logic           [NrMemPorts-1:0] spatz_mem_req_ready;
+  // A store is architecturally complete only after all of its writes are
+  // acknowledged. The count is global to the ordered VLSU commit queue, so
+  // waiting for zero also covers requests from younger queued stores.
+  logic commit_insn_complete;
+  assign commit_insn_complete = commit_insn_valid && &commit_finished_q &&
+                                mem_insn_finished_q[commit_insn_q.id] &&
+                                (commit_insn_q.is_load || stores_drained);
 
   always_comb begin: control_proc
     // Maintain state
@@ -563,7 +610,7 @@ module spatz_vlsu
     vlsu_finished_req = 1'b0;
 
     // Finished the execution!
-    if (commit_insn_valid && &commit_finished_q && mem_insn_finished_q[commit_insn_q.id]) begin
+    if (commit_insn_complete) begin
       commit_insn_pop = 1'b1;
       busy_d          = 1'b0;
 
@@ -585,8 +632,8 @@ module spatz_vlsu
 
   // Signal when we are finished with with accessing the memory (necessary
   // for the case with more than one memory port)
-  assign spatz_mem_finished_o     = commit_insn_valid && &commit_finished_q && mem_insn_finished_q[commit_insn_q.id];
-  assign spatz_mem_str_finished_o = commit_insn_valid && &commit_finished_q && mem_insn_finished_q[commit_insn_q.id] && !commit_insn_q.is_load;
+  assign spatz_mem_finished_o     = commit_insn_complete;
+  assign spatz_mem_str_finished_o = commit_insn_complete && !commit_insn_q.is_load;
 
   // Do we start at the very fist element
   logic mem_is_vstart_zero;
