@@ -845,7 +845,7 @@ module spatz_vfu
             reduction_d[1] = reduction_vector_data;
           end
           default: begin
-          `ifdef MEMPOOL_SPATZ
+          `ifdef SPATZ_VFU_REDUCTION_STUB
             reduction_d = '0;
           `else
             if (MAXEW == EW_64) begin
@@ -877,7 +877,7 @@ module spatz_vfu
         // Switch to intra-lane once we are done reading the whole vector from the VRF
 
         // verilator lint_off SELRANGE
-        `ifdef MEMPOOL_SPATZ
+        `ifdef SPATZ_VFU_REDUCTION_STUB
           reduction_d = '0;
         `else
           // Maintain the input operand or set to '0 for the inputs until valid results arrive
@@ -912,7 +912,7 @@ module spatz_vfu
         // Output is a single ELEN result from FU
 
         // verilator lint_off SELRANGE
-        `ifdef MEMPOOL_SPATZ
+        `ifdef SPATZ_VFU_REDUCTION_STUB
           reduction_d = '0;
         `else
           reduction_d[0] = result_valid ? $unsigned(result) : reduction_q[0];
@@ -973,7 +973,7 @@ module spatz_vfu
         // The final result goes into the SIMD reduction stage for smaller element widths or the writeback stage
 
         // verilator lint_off SELRANGE
-        `ifdef MEMPOOL_SPATZ
+        `ifdef SPATZ_VFU_REDUCTION_STUB
           reduction_d = '0;
         `else
             reduction_d[0] = (result_buf_valid_q ? $unsigned(result_buf_q) : $unsigned(result)) >> shift_amnt_q;
@@ -1014,7 +1014,7 @@ module spatz_vfu
         // In the SIMD stage, log tree reduction for lesser element widths is done
 
         // verilator lint_off SELRANGE
-        `ifdef MEMPOOL_SPATZ
+        `ifdef SPATZ_VFU_REDUCTION_STUB
           reduction_d = '0;
         `else
             reduction_d[0] = (result_buf_valid_q ? $unsigned(result_buf_q) : $unsigned(result)) >> shift_amnt_q;
