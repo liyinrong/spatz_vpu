@@ -58,10 +58,12 @@ module spatz_decoder
         riscv_instr::VLE16_V,
         riscv_instr::VLE32_V,
         riscv_instr::VLE64_V,
+`ifdef VENTAGLIO
         riscv_instr::VLX8_V,
         riscv_instr::VLX16_V,
         riscv_instr::VLX32_V,
         riscv_instr::VLX64_V,
+`endif
         riscv_instr::VLSE8_V,
         riscv_instr::VLSE16_V,
         riscv_instr::VLSE32_V,
@@ -130,6 +132,7 @@ module spatz_decoder
               spatz_req.op_vtl.is_load_idx = 1'b0;
             end
 
+`ifdef VENTAGLIO
             riscv_instr::VLX8_V,
             riscv_instr::VLX16_V,
             riscv_instr::VLX32_V,
@@ -151,6 +154,7 @@ module spatz_decoder
                 default: illegal_instr        = 1'b1;
               endcase
             end
+`endif
 
             riscv_instr::VLSE8_V,
             riscv_instr::VLSE16_V,
@@ -2012,11 +2016,14 @@ module spatz_decoder
             riscv_instr::CSR_VLENB,
             riscv_instr::CSR_VXSAT,
             riscv_instr::CSR_VXRM,
-            riscv_instr::CSR_VCSR,
-            riscv_instr::CSR_VTLREG,
-            riscv_instr::CSR_VTLIDXW,
-            riscv_instr::CSR_VTLBLKS,
-            riscv_instr::CSR_VTLRATIO: begin
+            riscv_instr::CSR_VCSR
+`ifdef VENTAGLIO
+            , riscv_instr::CSR_VTLREG
+            , riscv_instr::CSR_VTLIDXW
+            , riscv_instr::CSR_VTLBLKS
+            , riscv_instr::CSR_VTLRATIO
+`endif
+            : begin
               spatz_req.op_csr.addr = csr_addr;
             end
             default: illegal_instr = 1'b1;
@@ -2031,6 +2038,7 @@ module spatz_decoder
                 spatz_req.op_cfg.write_vstart = 1'b1;
               end
 
+`ifdef VENTAGLIO
               // This instruction is to config VTL status
               // We set the bit in op_cfg (not the op_vtl field)
               if (csr_addr == riscv_instr::CSR_VTLREG) begin
@@ -2052,6 +2060,7 @@ module spatz_decoder
                 spatz_req.use_rd              = csr_rd != '0;
                 spatz_req.op_cfg.set_vtl_ratio = 1'b1;
               end
+`endif
 
             end
 
