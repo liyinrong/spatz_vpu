@@ -254,6 +254,38 @@ module spatz_vlsu
   logic  [NrMemPorts-1:0] rob_full;
   logic  [NrMemPorts-1:0] rob_empty;
 
+`ifndef SYNTHESIS
+`ifdef MEMPOOL_SPATZ
+  // Response-channel contract (TeraNoC): the response channel has no usable
+  // backpressure, so a response that cannot be accepted is lost forever.
+  for (genvar port = 0; port < NrMemPorts; port++) begin: gen_rsp_contract_assertions
+    always_ff @(posedge clk_i) begin
+      if (rst_ni) begin
+        // Dropped response: load data arriving while the FSM cannot push it
+        // (only store acknowledgements may arrive outside load states).
+        assert (!(spatz_mem_rsp_valid_i[port] && !spatz_mem_rsp_i[port].write &&
+                  !(state_q inside {VLSU_RunningLoad, VLSU_ReadingV0_t})))
+          else $error("Spatz VLSU dropped a load response (wrong state)");
+        // Response-ID integrity: the id round-trips through the request's
+        // meta field; the ROB-allocated id zero-extends, so the high bits of
+        // a returning id must be zero. A nonzero high bit means the id was
+        // corrupted in transit (or the packing overflowed).
+        if ($bits(spatz_mem_rsp_i[port].id) > $bits(rob_id[port]))
+          assert (!(spatz_mem_rsp_valid_i[port] &&
+                    |spatz_mem_rsp_i[port].id[$bits(spatz_mem_rsp_i[port].id)-1:$bits(rob_id[port])]))
+            else $error("Spatz VLSU response id corrupted in transit");
+        // ROB balance: a load response must find its allocation (no push into
+        // a full ROB; the reorder_buffer's own full_write/empty_read cover
+        // the complementary cases).
+        assert (!(spatz_mem_rsp_valid_i[port] && !spatz_mem_rsp_i[port].write &&
+                  rob_full[port]))
+          else $error("Spatz VLSU load response with full ROB");
+      end
+    end
+  end: gen_rsp_contract_assertions
+`endif
+`endif
+
   // The reorder buffer decouples the memory side from the register file side.
   // All elements from one side to the other go through it.
   for (genvar port = 0; port < NrMemPorts; port++) begin : gen_rob
