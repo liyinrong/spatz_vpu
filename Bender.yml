@@ -23,6 +23,12 @@ dependencies:
   common_cells:       { git: "https://github.com/pulp-platform/common_cells.git",       version: 1.39.0         }
   fpnew:              { git: "https://github.com/pulp-platform/cvfpu.git",              rev:     feature/cfmadd }
   tech_cells_generic: { git: "https://github.com/pulp-platform/tech_cells_generic.git", version: 0.2.13         }
+  # Provided by the integrating parent (TeraNoC reuses its own modified
+  # packages; the paths resolve root-relative, exactly like the vendored
+  # spatz manifest). Declared so Bender propagates their include dirs
+  # (reqrsp_interface/typedef.svh) and orders their packages first.
+  snitch:             { path: "hardware/deps/snitch"                                                            }
+  reqrsp_interface:   { path: "hardware/deps/reqrsp_interface"                                                  }
 
 workspace:
   checkout_dir: "hw/ip"
