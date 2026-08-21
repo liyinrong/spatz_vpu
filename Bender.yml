@@ -9,26 +9,43 @@ package:
     - "Mattia Sinigaglia  <mattia.sinigaglia5@unibo.it>"
     - "Diyou Shen         <dishen@iis.ee.ethz.ch"
 
+# TeraNoC integration (branch teranoc-integration):
+# - common_cells/fpnew versions match the TeraNoC root manifest so the
+#   dependency graph unifies without conflicts (TeraNoC pins common_cells
+#   1.39.0 and cvfpu feature/cfmadd under the name `fpnew`; upstream's
+#   `FPnew`/`pulp-v0.1.3` would create a second, conflicting package).
+# - snitch and reqrsp_interface are intentionally NOT declared here: the
+#   integrating parent (TeraNoC) supplies its own modified packages, and the
+#   in-repo `hw/ip/snitch` checkout is empty. Declared as root-level overrides
+#   they still appear before these sources in the compile order.
+
 dependencies:
-  common_cells:       { git: "https://github.com/pulp-platform/common_cells.git",       version: 1.28.0         }
-  FPnew:              { git: "https://github.com/pulp-platform/cvfpu.git",              rev:     pulp-v0.1.3    }
+  common_cells:       { git: "https://github.com/pulp-platform/common_cells.git",       version: 1.39.0         }
+  fpnew:              { git: "https://github.com/pulp-platform/cvfpu.git",              rev:     feature/cfmadd }
   tech_cells_generic: { git: "https://github.com/pulp-platform/tech_cells_generic.git", version: 0.2.13         }
-  snitch:             { path: "hw/ip/snitch"                                                                    }
-  reqrsp_interface:   { path: "hw/ip/reqrsp_interface"                                                          }
 
 workspace:
   checkout_dir: "hw/ip"
 
+# Target structure for the TeraNoC opt-in profile:
+# - `spatz_upstream`: package-level sources (rvv_pkg/vtl_pkg/spatz_pkg) that
+#   mempool_cc references in every build; mirrors the vendored spatz package's
+#   always-compiled files. Mutually exclusive with the vendored `spatz`
+#   package, which TeraNoC gates behind not(spatz_upstream).
+# - `all(spatz, spatz_upstream)`: the full VPU RTL, compiled only for
+#   Spatz-enabled TeraNoC configs that select the upstream implementation.
 sources:
   ## hw/ip/spatz ##
-  - target: spatz
+  - target: spatz_upstream
     files:
-    # Level 0
-    - hw/src/reorder_buffer.sv
     - hw/src/rvv_pkg.sv
     - hw/src/vtl_pkg.sv
     # Level 1
     - hw/src/generated/spatz_pkg.sv
+  - target: all(spatz, spatz_upstream)
+    files:
+    # Level 0
+    - hw/src/reorder_buffer.sv
     - hw/src/spatz_serdiv.sv
     # Level 2
     - hw/src/spatz_decoder.sv
