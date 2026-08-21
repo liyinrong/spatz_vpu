@@ -522,6 +522,7 @@ module spatz_fpu_sequencer
 
   logic [DataWidth-1:0] fp_lsu_pdata;
   logic [4:0]           fp_lsu_ptag;
+  logic                 fp_lsu_pwrite;
   logic                 fp_lsu_pvalid;
   logic                 fp_lsu_pready;
 
@@ -535,6 +536,49 @@ module spatz_fpu_sequencer
   logic                 mem_perror;
   logic [IdWidth-1:0]   mem_pid;
 
+`ifdef MEMPOOL_SPATZ
+  // TeraNoC integration: the parent supplies TeraNoC's modified snitch_lsu
+  // (active-low reset, no dreq_t/drsp_t params, lsu_pwrite_o store-ack tap).
+  snitch_lsu #(
+    .NaNBox             (1                  ),
+    .NumOutstandingLoads(NumOutstandingLoads)
+  ) i_fp_lsu (
+    .clk_i        (clk_i           ),
+    .rst_ni       (rst_ni          ),
+    // Request interface
+    .lsu_qtag_i   (fp_lsu_qtag     ),
+    .lsu_qwrite   (fp_lsu_qwrite   ),
+    .lsu_qsigned  (fp_lsu_qsigned  ),
+    .lsu_qaddr_i  (fp_lsu_qaddr    ),
+    .lsu_qdata_i  (fp_lsu_qdata    ),
+    .lsu_qsize_i  (fp_lsu_qsize    ),
+    .lsu_qamo_i   (fp_lsu_qamo     ),
+    .lsu_qvalid_i (fp_lsu_qvalid   ),
+    .lsu_qready_o (fp_lsu_qready   ),
+    // Response interface
+    .lsu_pdata_o  (fp_lsu_pdata    ),
+    .lsu_ptag_o   (fp_lsu_ptag     ),
+    .lsu_perror_o (/* Unused */    ),
+    .lsu_pvalid_o (fp_lsu_pvalid   ),
+    .lsu_pwrite_o (fp_lsu_pwrite   ),
+    .lsu_pready_i (fp_lsu_pready   ),
+    .lsu_empty_o  (/* unused */    ),
+    // Memory interface
+    .data_qaddr_o (mem_qaddr              ),
+    .data_qwrite_o(mem_qwrite             ),
+    .data_qamo_o  (/* Unused */           ),
+    .data_qdata_o (mem_qdata              ),
+    .data_qstrb_o (mem_qstrb              ),
+    .data_qid_o   (mem_qid                ),
+    .data_qvalid_o(fp_lsu_mem_req_valid_o ),
+    .data_qready_i(fp_lsu_mem_req_ready_i ),
+    .data_pdata_i (mem_pdata              ),
+    .data_perror_i(mem_perror             ),
+    .data_pid_i   (mem_pid                ),
+    .data_pvalid_i(fp_lsu_mem_rsp_valid_i ),
+    .data_pready_o(fp_lsu_mem_rsp_ready_o )
+  );
+`else
   snitch_lsu #(
     .NaNBox             (1                  ),
     .dreq_t             (dreq_t             ),
@@ -562,25 +606,10 @@ module spatz_fpu_sequencer
     .lsu_pvalid_o (fp_lsu_pvalid   ),
     .lsu_pready_i (fp_lsu_pready   ),
     // Memory interface
-`ifdef MEMPOOL_SPATZ
-    .data_qaddr_o (mem_qaddr              ),
-    .data_qwrite_o(mem_qwrite             ),
-    .data_qamo_o  (/* Unused */           ),
-    .data_qdata_o (mem_qdata              ),
-    .data_qstrb_o (mem_qstrb              ),
-    .data_qid_o   (mem_qid                ),
-    .data_qvalid_o(fp_lsu_mem_req_valid_o ),
-    .data_qready_i(fp_lsu_mem_req_ready_i ),
-    .data_pdata_i (mem_pdata              ),
-    .data_perror_i(mem_perror             ),
-    .data_pid_i   (mem_pid                ),
-    .data_pvalid_i(fp_lsu_mem_rsp_valid_i ),
-    .data_pready_o(fp_lsu_mem_rsp_ready_o )
-`else
     .data_req_o   (fp_lsu_mem_req_o),
     .data_rsp_i   (fp_lsu_mem_rsp_i)
-`endif
   );
+`endif
 
   // Number of memory operations in the accelerator
   logic [2:0] acc_mem_cnt_q, acc_mem_cnt_d;
@@ -690,8 +719,10 @@ module spatz_fpu_sequencer
   //  Retire  //
   //////////////
 
+`ifndef MEMPOOL_SPATZ
   logic outstanding_store_q, outstanding_store_d;
   `FF(outstanding_store_q, outstanding_store_d, 1'b0)
+`endif
 
   always_comb begin
     // We are not retiring anything, by default
@@ -707,19 +738,28 @@ module spatz_fpu_sequencer
     fp_move_result_valid_i = 1'b0;
     fp_move_result_ready_i = 1'b0;
 
+`ifndef MEMPOOL_SPATZ
     outstanding_store_d = 1'b0;
+`endif
 
     // Do not forward results to Snitch
     resp_o       = '0;
     resp_valid_o = 1'b0;
     resp_ready_o = 1'b0;
 
+`ifdef MEMPOOL_SPATZ
+    // A scalar FP store is complete only when its TCDM acknowledgement is
+    // consumed; request acceptance merely queues it inside the LSU.
+    fp_lsu_mem_finished_o     = fp_lsu_pwrite;
+    fp_lsu_mem_str_finished_o = fp_lsu_pwrite;
+`else
     // Did we just finished writing something?
     fp_lsu_mem_finished_o     = outstanding_store_q || (fp_lsu_qwrite && fp_lsu_qvalid && fp_lsu_qready);
     fp_lsu_mem_str_finished_o = outstanding_store_q || (fp_lsu_qwrite && fp_lsu_qvalid && fp_lsu_qready);
 
     // Was there already a store committing in this cycle?
     outstanding_store_d = outstanding_store_q && (fp_lsu_qwrite && fp_lsu_qvalid && fp_lsu_qready);
+`endif
 
     // Is there a move trying to commit during this cycle?
     move_stall = is_move && use_rd && !fp_move_result_ready_o;
@@ -755,7 +795,11 @@ module spatz_fpu_sequencer
     end
 
     // Commit a FP LSU response
+`ifdef MEMPOOL_SPATZ
+    if (fp_lsu_pvalid) begin
+`else
     if (fp_lsu_pvalid && !outstanding_store_q) begin
+`endif
       fp_lsu_pready = 1'b1;
       retire[1]     = 1'b1;
 
@@ -763,8 +807,10 @@ module spatz_fpu_sequencer
       fpr_waddr[1] = fp_lsu_ptag;
       fpr_we[1]    = 1'b1;
 
+`ifndef MEMPOOL_SPATZ
       // Was there a store being acknowledged in this cycle?
       outstanding_store_d = fp_lsu_mem_str_finished_o;
+`endif
 
       // Finished a load
       fp_lsu_mem_finished_o     = 1'b1;
