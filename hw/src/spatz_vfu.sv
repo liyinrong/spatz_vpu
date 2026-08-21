@@ -1489,8 +1489,9 @@ assign vfcmp_result_accepted = result_tag.is_cmp && &(result_valid | ~pending_re
         ipu_result_pnt_d                                                = ipu_result_pnt_q + 1;
         int_ipu_result_ready                                            = 1'b1;
 
-        // Scalar operation
-        if (ipu_result_tag_d.wb || spatz_req.op_arith.is_reduction)
+        // Scalar operation (reset on the captured result's own tag, not on
+        // whatever request currently occupies the operation queue)
+        if (ipu_result_tag_d.wb || ipu_result_tag_d.reduction)
           ipu_result_pnt_d = '0;
       end
     end
