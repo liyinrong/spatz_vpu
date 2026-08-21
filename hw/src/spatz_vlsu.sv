@@ -692,7 +692,8 @@ module spatz_vlsu
       .push_i    (spatz_mem_req_valid[port] && spatz_mem_req_ready[port] && mem_is_load),
       .data_i    (mem_req_addr_offset[port]                                            ),
       .data_o    (vreg_addr_offset[port]                                               ),
-      .pop_i     (rob_pop[port] && commit_insn_q.is_load                               ),
+      .pop_i     (rob_pop[port] && commit_insn_q.is_load &&
+                  state_q == VLSU_RunningLoad              ),
       .usage_o   (/* Unused */                                                         )
     );
   end: gen_offset_queue
