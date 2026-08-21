@@ -995,8 +995,10 @@ module spatz_vlsu
       if (mem_is_load && spatz_mem_req_valid[port] && spatz_mem_req_ready[port])
         mem_pending_d[port]++;
 
-      // Response used
-      if (commit_insn_q.is_load && rob_rvalid[port] && rob_pop[port])
+      // Response used. RunningLoad-gated so the store-leftover drain (which
+      // can fire in the load branch while still in RunningStore) never
+      // decrements a counter that only tracks load responses (underflow).
+      if (commit_insn_q.is_load && state_q == VLSU_RunningLoad && rob_rvalid[port] && rob_pop[port])
         mem_pending_d[port]--;
     end
   end
@@ -1100,13 +1102,27 @@ module spatz_vlsu
     if (mem_spatz_req_ready)
       vs2_elem_id_d = '0;
 
-    if (commit_insn_valid && commit_insn_q.is_load) begin
+    // Select load vs store ROB handling by the committing instruction, but
+    // when the commit queue is momentarily empty (a bubble) fall back to the
+    // authoritative VLSU state. Otherwise a bubble sends us into the store
+    // else-branch, whose drain pops the mem-side's outstanding (not-yet-valid)
+    // load entries (empty_read) while the load-response push below is skipped,
+    // dropping responses. State only flips on &rob_empty, so during
+    // RunningLoad the ROB is exclusively loads.
+    if (commit_insn_valid ? commit_insn_q.is_load : (state_q == VLSU_RunningLoad)) begin
       // If we have a valid element in the buffer, put it back to the register file
       if (state_q == VLSU_RunningLoad && |commit_operation_valid) begin
         // Enable write back to the VRF if we have a valid element in all buffers that still have to write something back.
         vrf_req_d.waddr = vd_vreg_addr;
-        // rob_rvalid: data is in the rob ready to be written back to VRF
-        vrf_req_valid_d = &(rob_rvalid | ~mem_pending) && |mem_pending && (commit_insn_q.vm || v0_t_read_done);
+        // rob_rvalid: data is in the rob ready to be written back to VRF.
+        // Gate on the commit-side element counters, NOT on mem_pending:
+        // mem_pending counts *issued* requests, so a port whose last beats are
+        // still stuck behind NoC backpressure reads 0 and used to be treated
+        // as "owes no data". The writeback then fired early with garbage in
+        // that port's lanes, commit_counter advanced without a matching ROB
+        // pop, and the load committed while responses were in flight.
+        // commit_finished_q is the authoritative per-FU "delivered its quota".
+        vrf_req_valid_d = &(rob_rvalid | commit_finished_q) && !(&commit_finished_q) && (commit_insn_q.vm || v0_t_read_done);
         for (int unsigned port = 0; port < NrMemPorts; port++) begin
           automatic logic [63:0] data = rob_rdata[port];
 
@@ -1185,18 +1201,32 @@ module spatz_vlsu
         rob_wdata[port] = spatz_mem_rsp_i[port].data;
 `ifdef MEMPOOL_SPATZ
         rob_wid[port]   = spatz_mem_rsp_i[port].id;
-        // Need to consider out-of-order memory response
-        rob_push[port]  = spatz_mem_rsp_valid_i[port] && (state_q == VLSU_RunningLoad || state_q == VLSU_ReadingV0_t) && store_count_q[port] == '0;
+        // Need to consider out-of-order memory response. The response write
+        // flag (round-tripped through the request id) classifies load data vs
+        // store acknowledgements exactly; only load data enters the ROB.
+        rob_push[port]  = spatz_mem_rsp_valid_i[port] && (state_q == VLSU_RunningLoad || state_q == VLSU_ReadingV0_t) && spatz_mem_rsp_i[port].write == '0;
 `else
         rob_push[port]  = spatz_mem_rsp_valid_i[port] && (state_q == VLSU_RunningLoad || state_q == VLSU_ReadingV0_t) && store_count_q[port] == '0;
 `endif
+        // A store pushes VRF data to every port's ROB, and only the store
+        // branch drains ports with no beats left. If the store commits and
+        // the head flips to this load before that drain finishes, the
+        // leftovers strand here (rob never empties, the Store->Load switch
+        // never fires). While still in RunningStore every ROB entry is store
+        // data (load issue is RunningLoad-gated below), so draining is safe.
+        if (state_q == VLSU_RunningStore && !rob_empty[port])
+          rob_pop[port] = 1'b1;
         if (!rob_full[port] && !offset_queue_full[port] && mem_operation_valid[port]) begin
           rob_req_id[port]     = spatz_mem_req_ready[port] & spatz_mem_req_valid[port];
 
           // If we have an index oepration, we ensure we are not fetching the next index
           // This is because fetch_next_idx uses mem_idx_counter_q signal and requires a 1 cycle bubble before issuing the next index operation
           // This could be optimized but index operations are anyways slow and not performance critical
-          mem_req_lvalid[port] = (!mem_is_indexed || (vrf_rvalid_i[1] && mem_idx_word_ok[port])) && mem_spatz_req.op_mem.is_load;
+          // Only issue load requests in RunningLoad: a response arriving
+          // while the FSM still sits in RunningStore (Store->Load switch
+          // window) cannot be pushed (rob_push is state-gated) and would leak
+          // its ROB allocation forever.
+          mem_req_lvalid[port] = (!mem_is_indexed || (vrf_rvalid_i[1] && mem_idx_word_ok[port])) && mem_spatz_req.op_mem.is_load && (state_q == VLSU_RunningLoad);
           mem_req_id[port]     = rob_id[port];
           mem_req_last[port]   = mem_operation_last[port];
         end
