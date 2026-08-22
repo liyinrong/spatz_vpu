@@ -102,6 +102,10 @@ module spatz_fpu_sequencer
     .ZERO_REG_ZERO (0           )
   ) i_fpr (
     .clk_i  (clk_i    ),
+`ifdef MEMPOOL_SPATZ
+    // TeraNoC's snitch_regfile exposes (and requires) the reset port.
+    .rst_ni (rst_ni   ),
+`endif
     .raddr_i(fpr_raddr),
     .rdata_o(fpr_rdata),
     .waddr_i(fpr_waddr),
