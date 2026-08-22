@@ -274,14 +274,6 @@ module spatz_vlsu
           assert (!(spatz_mem_rsp_valid_i[port] &&
                     |spatz_mem_rsp_i[port].id[$bits(spatz_mem_rsp_i[port].id)-1:$bits(rob_id[port])]))
             else $error("Spatz VLSU response id corrupted in transit");
-        // ROB balance: a load response with nothing outstanding on the port
-        // is spurious (mem_pending counts issued-minus-consumed requests, so
-        // an in-flight response still counts as pending). A response writing
-        // into a *full* ROB is legal -- full_o asserts at NumWords-1 and the
-        // response targets its own allocated slot -- so do not assert on it.
-        assert (!(spatz_mem_rsp_valid_i[port] && !spatz_mem_rsp_i[port].write &&
-                  mem_pending_q[port] == '0))
-          else $error("Spatz VLSU load response with no request outstanding");
       end
     end
   end: gen_rsp_contract_assertions
@@ -1084,6 +1076,25 @@ module spatz_vlsu
         mem_pending_d[port]--;
     end
   end
+
+`ifndef SYNTHESIS
+`ifdef MEMPOOL_SPATZ
+  // ROB balance: a load response with nothing outstanding on the port is
+  // spurious (mem_pending counts issued-minus-consumed requests, so an
+  // in-flight response still counts as pending). A response writing into a
+  // *full* ROB is legal -- full_o asserts at NumWords-1 and the response
+  // targets its own allocated slot -- so do not assert on it.
+  for (genvar port = 0; port < NrMemPorts; port++) begin: gen_rsp_spurious_assertions
+    always_ff @(posedge clk_i) begin
+      if (rst_ni) begin
+        assert (!(spatz_mem_rsp_valid_i[port] && !spatz_mem_rsp_i[port].write &&
+                  mem_pending_q[port] == '0))
+          else $error("Spatz VLSU load response with no request outstanding");
+      end
+    end
+  end: gen_rsp_spurious_assertions
+`endif
+`endif
 
   // Generate masking based on v0.t
   logic [VLEN-1:0] vm_masking;
