@@ -386,14 +386,26 @@ module spatz_fpu_sequencer
           end
         end
 
-        // Floating-Point Load/Store
+        // Floating-Point Load/Store. Under MEMPOOL_SPATZ, FLB/FSB are
+        // excluded: their funct3=000 encoding (opcode 0000111/0100111)
+        // aliases the RVV unit-stride/indexed byte loads/stores
+        // (VLE8_V/VSE8_V/VLUXEI8/...), which the vector unit owns on a Spatz
+        // (RVV-on) core. Claiming them here mis-routes a vector byte access
+        // as a scalar FP byte op -- the instruction silently retires as a
+        // scalar FP-LSU byte load/store and the vector never happens.
+        // (TeraNoC vendored equivalent; the scalar FLB/FSB encoding is
+        // decoded only on non-RVV cores.)
+`ifndef MEMPOOL_SPATZ
         riscv_instr::FLB,
+`endif
         riscv_instr::FLH,
         riscv_instr::FLW,
         riscv_instr::FLD: begin
           use_fd = 1'b1;
           casez (issue_req_i.data_op)
+`ifndef MEMPOOL_SPATZ
             riscv_instr::FLB: ls_size    = Byte;
+`endif
             riscv_instr::FLH: ls_size          = HalfWord;
             riscv_instr::FLW: ls_size          = Word;
             riscv_instr::FLD: if (RVD) ls_size = Double;
@@ -402,13 +414,17 @@ module spatz_fpu_sequencer
           is_load      = 1'b1;
           illegal_inst = !RVD && issue_req_i.data_op inside {riscv_instr::FLD};
         end
+`ifndef MEMPOOL_SPATZ
         riscv_instr::FSB,
+`endif
         riscv_instr::FSH,
         riscv_instr::FSW,
         riscv_instr::FSD: begin
           use_fs2 = 1'b1;
           casez (issue_req_i.data_op)
+`ifndef MEMPOOL_SPATZ
             riscv_instr::FSB: ls_size    = Byte;
+`endif
             riscv_instr::FSH: ls_size          = HalfWord;
             riscv_instr::FSW: ls_size          = Word;
             riscv_instr::FSD: if (RVD) ls_size = Double;
