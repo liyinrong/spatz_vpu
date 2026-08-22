@@ -463,7 +463,34 @@ module spatz_vfu
   // Reduction registers
   vrf_data_t [$clog2(N_FU)-1:0] reduction_q, reduction_d;
   vrf_data_t reduction_vector_data, reduction_scalar_data;
-  `FF(reduction_q, reduction_d, '0)
+  // Reduction FU-op handshake: a presented op must be held until the FU
+  // input stage actually accepts it. `reduction_op_fire` marks the cycle the
+  // FSM loads a new op (loads reduction_q, sets the presented flag);
+  // `reduction_op_accepted` when the FU input takes the presented op;
+  // `reduction_can_fire` blocks new fires while one waits unaccepted.
+  // Without this the free-running operand register was overwritten by the
+  // next VRF word whenever the FPU input backpressured mid-reduction,
+  // silently dropping words from the accumulation (seen as wrong totals on
+  // multi-word reduction groups).
+  logic reduction_op_fire, reduction_op_accepted, reduction_can_fire;
+  // Absorb: a reduction result arrived while an op is still waiting for the
+  // FU input. The result must leave the FU output (else its backpressure
+  // blocks the acceptance and the FSM deadlocks); fold it into the waiting
+  // op's accumulator operand (order-free combine stage).
+  // Result hold for reduction results that cannot chain into a fired op
+  // this cycle. Depth 4 exceeds the maximum number of unconsumed in-flight
+  // results (FU input register + pipeline stages + 1), so the FU output
+  // always drains in the combine stages and its input can never back up and
+  // clobber a queued operand.
+  typedef struct packed {
+    vrf_data_t data;
+    vfu_tag_t  tag;
+  } red_hold_t;
+  red_hold_t [3:0] red_hold_q, red_hold_d;
+  logic [2:0]      red_hold_cnt_q, red_hold_cnt_d;
+  `FF(red_hold_q, red_hold_d, '{default: '0})
+  `FF(red_hold_cnt_q, red_hold_cnt_d, '0)
+  `FFL(reduction_q, reduction_d, reduction_op_fire, '0)
   elen_t reduction_neutral_value;
 
   // IPU results
@@ -625,8 +652,33 @@ module spatz_vfu
   vlen_t fill_cnt;
   assign fill_cnt = ((spatz_req.vl - 1) >> (MAXEW - spatz_req.vtype.vsew)) >> (is_fpu_insn ? $clog2(N_FPU) : $clog2(N_IPU));
 
+`ifndef SYNTHESIS
+  // PLANB-DEBUG (temporary): per-cycle reduction FSM op/consume trace.
+  always_ff @(posedge clk_i) begin
+    if (rst_ni && reduction_state_q != Reduction_NormalExecution) begin
+      if (reduction_operand_ready_q)
+        $display("[PLANB-RED] @%0t st=%0d OP   ptr=%0d op0[0]=%08x op1[0]=%08x",
+          $time, reduction_state_q, reduction_pointer_q,
+          reduction_q[0][31:0], reduction_q[1][31:0]);
+      if (result_valid[0] && result_ready)
+        $display("[PLANB-RED] @%0t st=%0d TAKE res[0]=%08x tagred=%0d bufv=%0d",
+          $time, reduction_state_q, result[31:0], result_tag.reduction,
+          result_buf_valid_q);
+      if (reduction_done)
+        $display("[PLANB-RED] @%0t st=%0d DONE", $time, reduction_state_q);
+    end
+  end
+`endif
+
   // Are the reduction operands ready?
-  `FF(reduction_operand_ready_q, reduction_operand_ready_d, 1'b0)
+  // Presented-flag: set on fire, cleared on acceptance, held otherwise.
+  `FFL(reduction_operand_ready_q, reduction_op_fire,
+       reduction_op_fire || reduction_op_accepted, 1'b0)
+  assign reduction_op_accepted = reduction_operand_ready_q &&
+                                 &(in_ready | ~valid_operations);
+  assign reduction_can_fire    = !reduction_operand_ready_q ||
+                                 reduction_op_accepted;
+  assign reduction_op_fire     = reduction_operand_ready_d && reduction_can_fire;
 
   // Do we need to request reduction operands?
   logic [1:0] reduction_operand_request;
@@ -722,6 +774,8 @@ module spatz_vfu
     // No operands
     reduction_d               = reduction_q;
     reduction_operand_ready_d = 1'b0;
+    red_hold_d                = red_hold_q;
+    red_hold_cnt_d            = red_hold_cnt_q;
 
     // Did we issue a word to the FUs?
     word_issued = 1'b0;
@@ -868,7 +922,7 @@ module spatz_vfu
           end
         endcase
         // verilator lint_on SELRANGE
-        if (vrf_rvalid_i[0] && vrf_rvalid_i[1]) begin
+        if (vrf_rvalid_i[0] && vrf_rvalid_i[1] && reduction_can_fire) begin
           reduction_operand_ready_d = 1'b1;
           reduction_pointer_d = reduction_pointer_q + 1;
           reduction_state_d = Reduction_Reduce;
@@ -892,11 +946,14 @@ module spatz_vfu
         `ifdef SPATZ_VFU_REDUCTION_STUB
           reduction_d = '0;
         `else
-          // Maintain the input operand or set to '0 for the inputs until valid results arrive.
-          // Only the reduction's own results may feed the accumulator; a
-          // straggler from the previous instruction drains via the default
+          // Operand 0: oldest held result first, then a live result chained
+          // into this cycle's op, else the identity/running value. Only the
+          // reduction's own results may feed the accumulator; a straggler
+          // from the previous instruction drains via the default
           // result_ready and must not be latched here.
-          reduction_d[0] = (result_valid && result_tag.reduction) ? result : spatz_req.op inside {VFMINMAX, VAND, VOR, VMAX, VMAXU, VMIN, VMINU} ? reduction_q[0] : '0;
+          reduction_d[0] = (red_hold_cnt_q != 0) ? red_hold_q[0].data :
+                           (result_valid && result_tag.reduction) ? result :
+                           spatz_req.op inside {VFMINMAX, VAND, VOR, VMAX, VMAXU, VMIN, VMINU} ? reduction_q[0] : '0;
           if ((N_IPU>0) && ~is_fpu_insn) begin
             // If IPU is used and if the DLEN < VRF word size, select the chunk
             reduction_d[1] = (VRFWordWidth==N_IPU*ELEN) ? $unsigned(reduction_vector_data) :
@@ -907,16 +964,36 @@ module spatz_vfu
         `endif
 
         // verilator lint_on SELRANGE
-        if (vrf_rvalid_i[1]) begin
+        if (vrf_rvalid_i[1] && reduction_can_fire) begin
           reduction_operand_ready_d = 1'b1;
           reduction_pointer_d = reduction_pointer_q + 1;
           word_issued = is_fpu_insn ? 1'b1 : (VRFWordWidth==ELEN*N_IPU) ? 1'b1 : !(|pnt) ? 1'b1 : 1'b0;
-          if (result_valid[0] && result_tag.reduction) begin
-            result_ready = 1'b1;
+          if (red_hold_cnt_q != 0) begin
+            // op0 pops the oldest held result
+            red_hold_d[0] = red_hold_q[1];
+            red_hold_d[1] = red_hold_q[2];
+            red_hold_d[2] = red_hold_q[3];
+            red_hold_cnt_d = red_hold_cnt_q - 1'b1;
           end
+          // The last word's (and any held partials') results are drained by
+          // the IntraLane stage, which also pops the hold.
           if (reduction_pointer_q == fill_cnt) begin
-            reduction_state_d = Reduction_IntraLane;
+            reduction_state_d   = Reduction_IntraLane;
             reduction_pointer_d = '0;
+          end
+        end
+
+        // Drain the reduction's own results immediately: chained into a fired
+        // op, else pushed into the hold. Only a full hold with no fire leaves
+        // a result at the FU output, and only until the next fire.
+        if (result_valid[0] && result_tag.reduction) begin
+          if (reduction_op_fire && (red_hold_cnt_q == 0)) begin
+            result_ready = 1'b1;  // chained into the fired op
+          end else if (red_hold_cnt_d != 4) begin
+            result_ready = 1'b1;  // push at the (post-pop) tail
+            red_hold_d[red_hold_cnt_d].data = result;
+            red_hold_d[red_hold_cnt_d].tag  = result_tag;
+            red_hold_cnt_d = red_hold_cnt_d + 1'b1;
           end
         end
       end
@@ -930,23 +1007,36 @@ module spatz_vfu
         `ifdef SPATZ_VFU_REDUCTION_STUB
           reduction_d = '0;
         `else
-          reduction_d[0] = (result_valid && result_tag.reduction) ? $unsigned(result) : reduction_q[0];
+          // A fold candidate: a live reduction result, else the oldest held
+          // one (the hold drains here; it must be empty before the exit).
+          reduction_d[0] = (result_valid && result_tag.reduction) ? $unsigned(result) :
+                           (red_hold_cnt_q != 0) ? red_hold_q[0].data : reduction_q[0];
           reduction_d[1] = result_buf_valid_q ? $unsigned(result_buf_q) :  reduction_q[1];
         `endif
-        lat_count_d = result_valid[0] ? '0 : lat_count_q + 1;
+        lat_count_d = (result_valid[0] || (red_hold_cnt_q != 0)) ? '0 : lat_count_q + 1;
 
         // verilator lint_on SELRANGE
-        if (~result_buf_valid_q & result_valid[0] & result_tag.reduction) begin
-          // First result is written into a buffer and its tag
+        if (~result_buf_valid_q & ((result_valid[0] & result_tag.reduction) | (red_hold_cnt_q != 0))) begin
+          // First value is written into a buffer, with its tag
           result_buf_valid_d = 1'b1;
-          result_buf_d = result;
-          result_buf_tag_d = result_tag;
-          result_ready = 1'b1;
+          if (result_valid[0] && result_tag.reduction) begin
+            result_buf_d     = result;
+            result_buf_tag_d = result_tag;
+            result_ready     = 1'b1;
+          end else begin
+            // pop the hold
+            result_buf_d      = red_hold_q[0].data;
+            result_buf_tag_d  = red_hold_q[0].tag;
+            red_hold_d[0]     = red_hold_q[1];
+            red_hold_d[1]     = red_hold_q[2];
+            red_hold_d[2]     = red_hold_q[3];
+            red_hold_cnt_d    = red_hold_cnt_q - 1'b1;
+          end
         end
 
         // verilator lint_on SELRANGE
-        else if (result_buf_valid_q & result_valid[0] & result_tag.reduction) begin
-          // If there is an existing result in buffer and one from FU, initiate a reduction
+        else if (result_buf_valid_q & ((result_valid[0] & result_tag.reduction) | (red_hold_cnt_q != 0)) & reduction_can_fire) begin
+          // If there is an existing result in buffer and one to combine, initiate a reduction
 
           // Trigger a request
           reduction_operand_ready_d = 1'b1;
@@ -955,13 +1045,29 @@ module spatz_vfu
           // Bump pointer
           reduction_pointer_d = reduction_pointer_q + 1;
 
-          // Acknowledge result
-          result_ready = 1'b1;
+          // Acknowledge result (or pop the hold)
+          if (result_valid[0] && result_tag.reduction) begin
+            result_ready = 1'b1;
+          end else begin
+            red_hold_d[0]     = red_hold_q[1];
+            red_hold_d[1]     = red_hold_q[2];
+            red_hold_d[2]     = red_hold_q[3];
+            red_hold_cnt_d    = red_hold_cnt_q - 1'b1;
+          end
         end
 
-        // Are we done?
+        // Buffer full and no fire possible: park the live result in the hold
+        // so the FU output never stalls the input acceptance.
+        else if (result_valid[0] && result_tag.reduction && (red_hold_cnt_d != 4)) begin
+          result_ready = 1'b1;
+          red_hold_d[red_hold_cnt_d].data = result;
+          red_hold_d[red_hold_cnt_d].tag  = result_tag;
+          red_hold_cnt_d = red_hold_cnt_d + 1'b1;
+        end
+
+        // Are we done? (hold drained, pipeline quiet for the FU latency)
         // Wait until FU latency to ensure the pipelines are drained
-        if (!result_valid[0] && (lat_count_q > (FPUlatency + 1))) begin
+        if (!result_valid[0] && (red_hold_cnt_q == 0) && (lat_count_q > (FPUlatency + 1))) begin
           reduction_state_d = Reduction_InterLane;
 
           // Written for max 8 FPU / 8 IPUs
@@ -996,7 +1102,7 @@ module spatz_vfu
         `endif
 
         // verilator lint_on SELRANGE
-        if ((result_valid[0] && result_tag.reduction) || result_buf_valid_q) begin
+        if (((result_valid[0] && result_tag.reduction) || result_buf_valid_q) && reduction_can_fire) begin
             // Trigger a request
             reduction_operand_ready_d = 1'b1;
 
@@ -1037,7 +1143,7 @@ module spatz_vfu
         `endif
 
         // verilator lint_on SELRANGE
-        if ((result_valid[0] && result_tag.reduction) || result_buf_valid_q) begin
+        if (((result_valid[0] && result_tag.reduction) || result_buf_valid_q) && reduction_can_fire) begin
 
             result_buf_valid_d = 1'b0;
 
