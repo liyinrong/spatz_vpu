@@ -722,28 +722,6 @@ module spatz_controller
   logic                                   insn_shortcut_en;
   spatz_id_t                              insn_shortcut_id;
 
-`ifndef SYNTHESIS
-  // PLANB-DEBUG (temporary): dump issue state when nothing dispatches.
-  int unsigned planb_ctl_wd_q;
-  always_ff @(posedge clk_i) begin
-    if (!rst_ni) begin
-      planb_ctl_wd_q <= 0;
-    end else begin
-      if (issue_valid_i || spatz_req_valid)
-        planb_ctl_wd_q <= 0;
-      else if (|running_insn_q)
-        planb_ctl_wd_q <= planb_ctl_wd_q + 1;
-      else
-        planb_ctl_wd_q <= 0;
-      if (planb_ctl_wd_q == 32'd2000)
-        $display("[PLANB-CTL] %m @%0t running=%b req: id=%0d unit=%0d op=%0d | stalls vfu=%0d vlsu=%0d vsldu=%0d csr=%0d | deps0=%b deps1=%b deps2=%b deps3=%b wrote=%b",
-          $time, running_insn_q, spatz_req.id, spatz_req.ex_unit, spatz_req.op,
-          vfu_stall, vlsu_stall, vsldu_stall, csr_stall,
-          scoreboard_q[0].deps, scoreboard_q[1].deps,
-          scoreboard_q[2].deps, scoreboard_q[3].deps, wrote_result_q);
-    end
-  end
-`endif
 
   find_first_one #(
     .WIDTH(NrParallelInstructions)
@@ -753,20 +731,6 @@ module spatz_controller
     .no_ones_o  (running_insn_full)
   );
 
-`ifndef SYNTHESIS
-  // PLANB-DEBUG (temporary): every accept + dispatch decision.
-  always_ff @(posedge clk_i) begin
-    if (rst_ni) begin
-      if (issue_valid_i && issue_ready_o)
-        $display("[PLANB-ISS] %m @%0t op=%0d unit=%0d accept=%0d illegal=%0d vl=%0d", $time,
-          decoder_rsp.spatz_req.op, decoder_rsp.spatz_req.ex_unit,
-          issue_rsp_o.accept, decoder_rsp.instr_illegal, vl_q);
-      if (req_buffer_pop)
-        $display("[PLANB-DISP] %m @%0t id=%0d unit=%0d op=%0d vl=%0d", $time,
-          spatz_req.id, spatz_req.ex_unit, spatz_req.op, spatz_req.vl);
-    end
-  end
-`endif
 
   // Pop the buffer if we do not have a unit stall
   assign req_buffer_pop = !stall && req_buffer_valid && !running_insn_full;

@@ -652,23 +652,6 @@ module spatz_vfu
   vlen_t fill_cnt;
   assign fill_cnt = ((spatz_req.vl - 1) >> (MAXEW - spatz_req.vtype.vsew)) >> (is_fpu_insn ? $clog2(N_FPU) : $clog2(N_IPU));
 
-`ifndef SYNTHESIS
-  // PLANB-DEBUG (temporary): per-cycle reduction FSM op/consume trace.
-  always_ff @(posedge clk_i) begin
-    if (rst_ni && reduction_state_q != Reduction_NormalExecution) begin
-      if (reduction_operand_ready_q)
-        $display("[PLANB-RED] @%0t st=%0d OP   ptr=%0d op0[0]=%08x op1[0]=%08x",
-          $time, reduction_state_q, reduction_pointer_q,
-          reduction_q[0][31:0], reduction_q[1][31:0]);
-      if (result_valid[0] && result_ready)
-        $display("[PLANB-RED] @%0t st=%0d TAKE res[0]=%08x tagred=%0d bufv=%0d",
-          $time, reduction_state_q, result[31:0], result_tag.reduction,
-          result_buf_valid_q);
-      if (reduction_done)
-        $display("[PLANB-RED] @%0t st=%0d DONE", $time, reduction_state_q);
-    end
-  end
-`endif
 
   // Are the reduction operands ready?
   // Presented-flag: set on fire, cleared on acceptance, held otherwise.
