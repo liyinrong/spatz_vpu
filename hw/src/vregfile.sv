@@ -96,7 +96,15 @@ module vregfile import spatz_pkg::*; #(
   for (genvar vreg = 0; vreg < NrWords; vreg++) begin: gen_write_mem
     for (genvar b = 0; b < WordWidth/8; b++) begin: gen_word
       always_latch begin
-        if (col_clk[vreg][b])
+        // Reset the VRF to zero so unwritten vector registers read 0.
+        // TeraNoC kernels seed reductions with unwritten accumulator
+        // registers (vfredusum.vs into a group whose element 0 was never
+        // written); without this the uninitialized latch content reads X
+        // and poisons the whole tree. Matches the TeraNoC vendored
+        // vregfile.
+        if (!rst_ni)
+          mem[vreg][b] <= '0;
+        else if (col_clk[vreg][b])
           mem[vreg][b] <= wdata_q[b*8 +: 8];
       end
     end: gen_word
