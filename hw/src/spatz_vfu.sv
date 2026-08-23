@@ -488,7 +488,7 @@ module spatz_vfu
   } red_hold_t;
   red_hold_t [3:0] red_hold_q, red_hold_d;
   logic [2:0]      red_hold_cnt_q, red_hold_cnt_d;
-  `FF(red_hold_q, red_hold_d, '{default: '0})
+  `FF(red_hold_q, red_hold_d, '0)
   `FF(red_hold_cnt_q, red_hold_cnt_d, '0)
   `FFL(reduction_q, reduction_d, reduction_op_fire, '0)
   elen_t reduction_neutral_value;
