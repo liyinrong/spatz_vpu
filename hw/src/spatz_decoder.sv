@@ -412,9 +412,22 @@ module spatz_decoder
           spatz_req.vd          = arith_d;
           spatz_req.ex_unit     = VFU;
 
+          `ifndef MEMPOOL_SPATZ
+
+
+          // Scalar ops must not depend on vector CSR state; MemPool's
+
+
+          // vtype resets to vill=1. The vendored fork has no vill gates.
+
+
           if (decoder_req_i.vtype.vill) begin
             illegal_instr = 1'b1;
           end
+
+
+          `endif
+
 
           // Decide which operands to use (vs1 or rs1 or imm)
           unique case (func3)
@@ -926,9 +939,22 @@ module spatz_decoder
           automatic vreg_t arith_s2 = decoder_req_i.instr[24:20];
           automatic vreg_t arith_d  = decoder_req_i.instr[11:7];
 
+          `ifndef MEMPOOL_SPATZ
+
+
+          // Scalar ops must not depend on vector CSR state; MemPool's
+
+
+          // vtype resets to vill=1. The vendored fork has no vill gates.
+
+
           if (decoder_req_i.vtype.vill) begin
             illegal_instr = 1'b1;
           end
+
+
+          `endif
+
 
           spatz_req.op                 = VADD;
           spatz_req.ex_unit            = VFU;
@@ -1047,9 +1073,22 @@ module spatz_decoder
             spatz_req.rm          = fpu_rnd_mode_i;
             spatz_req.fm          = fpu_fmt_mode_i;
 
+            `ifndef MEMPOOL_SPATZ
+
+
+            // Scalar ops must not depend on vector CSR state; MemPool's
+
+
+            // vtype resets to vill=1. The vendored fork has no vill gates.
+
+
             if (decoder_req_i.vtype.vill) begin
               illegal_instr = 1'b1;
             end
+
+
+            `endif
+
 
             // Decide which operands to use (vs2 or rs1 or imm)
             unique case (func3)
@@ -1495,9 +1534,22 @@ module spatz_decoder
             automatic vreg_t arith_s2 = decoder_req_i.instr[24:20];
             automatic vreg_t arith_d  = decoder_req_i.instr[11:7];
 
+            `ifndef MEMPOOL_SPATZ
+
+
+            // Scalar ops must not depend on vector CSR state; MemPool's
+
+
+            // vtype resets to vill=1. The vendored fork has no vill gates.
+
+
             if (decoder_req_i.vtype.vill) begin
               illegal_instr = 1'b1;
             end
+
+
+            `endif
+
 
             spatz_req.op                 = VADD;
             spatz_req.ex_unit            = VFU;
@@ -1525,9 +1577,23 @@ module spatz_decoder
           spatz_req.vtype.vsew         = EW_32;
           spatz_req.op_arith.is_scalar = 1'b1;
 
+`ifndef MEMPOOL_SPATZ
+          // Scalar mul/div ride the vector datapath upstream; vill gates them.
+          // MemPool treats them as plain accelerator ops (see vendored fork):
+          // they must not depend on vector CSR state.
+          `ifndef MEMPOOL_SPATZ
+
+          // Scalar ops must not depend on vector CSR state; MemPool's
+
+          // vtype resets to vill=1. The vendored fork has no vill gates.
+
           if (decoder_req_i.vtype.vill) begin
             illegal_instr = 1'b1;
           end
+
+          `endif
+
+`endif
 
           unique casez (decoder_req_i.instr)
             riscv_instr::MUL   : spatz_req.op = VMUL;
@@ -1552,9 +1618,20 @@ module spatz_decoder
           spatz_req.vtype.vsew         = EW_32;
           spatz_req.op_arith.is_scalar = 1'b1;
 
+`ifndef MEMPOOL_SPATZ
+          `ifndef MEMPOOL_SPATZ
+
+          // Scalar ops must not depend on vector CSR state; MemPool's
+
+          // vtype resets to vill=1. The vendored fork has no vill gates.
+
           if (decoder_req_i.vtype.vill) begin
             illegal_instr = 1'b1;
           end
+
+          `endif
+
+`endif
 
           unique casez (decoder_req_i.instr)
             riscv_instr::DIV : spatz_req.op = VDIV;
@@ -1600,9 +1677,22 @@ module spatz_decoder
             spatz_req.fm                 = fpu_fmt_mode_i;
             spatz_req.vtype.vsew         = EW_8;
 
+            `ifndef MEMPOOL_SPATZ
+
+
+            // Scalar ops must not depend on vector CSR state; MemPool's
+
+
+            // vtype resets to vill=1. The vendored fork has no vill gates.
+
+
             if (decoder_req_i.vtype.vill) begin
               illegal_instr = 1'b1;
             end
+
+
+            `endif
+
 
             unique casez (decoder_req_i.instr)
               riscv_instr::FADD_B : spatz_req.op = VFADD;
@@ -1708,9 +1798,22 @@ module spatz_decoder
             spatz_req.fm                 = fpu_fmt_mode_i;
             spatz_req.vtype.vsew         = EW_16;
 
+            `ifndef MEMPOOL_SPATZ
+
+
+            // Scalar ops must not depend on vector CSR state; MemPool's
+
+
+            // vtype resets to vill=1. The vendored fork has no vill gates.
+
+
             if (decoder_req_i.vtype.vill) begin
               illegal_instr = 1'b1;
             end
+
+
+            `endif
+
 
             unique casez (decoder_req_i.instr)
               riscv_instr::FADD_H : spatz_req.op = VFADD;
@@ -1817,9 +1920,22 @@ module spatz_decoder
             spatz_req.fm                 = fpu_fmt_mode_i;
             spatz_req.vtype.vsew         = EW_32;
 
+            `ifndef MEMPOOL_SPATZ
+
+
+            // Scalar ops must not depend on vector CSR state; MemPool's
+
+
+            // vtype resets to vill=1. The vendored fork has no vill gates.
+
+
             if (decoder_req_i.vtype.vill) begin
               illegal_instr = 1'b1;
             end
+
+
+            `endif
+
 
             unique casez (decoder_req_i.instr)
               riscv_instr::FADD_S : spatz_req.op = VFADD;
@@ -1924,9 +2040,22 @@ module spatz_decoder
             spatz_req.fm                 = fpu_fmt_mode_i;
             spatz_req.vtype.vsew         = EW_64;
 
+            `ifndef MEMPOOL_SPATZ
+
+
+            // Scalar ops must not depend on vector CSR state; MemPool's
+
+
+            // vtype resets to vill=1. The vendored fork has no vill gates.
+
+
             if (decoder_req_i.vtype.vill) begin
               illegal_instr = 1'b1;
             end
+
+
+            `endif
+
 
             unique casez (decoder_req_i.instr)
               riscv_instr::FADD_D : spatz_req.op = VFADD;
