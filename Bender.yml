@@ -133,13 +133,21 @@ sources:
 
 
   ## hw/ip/spatz ##
+  # rvv_pkg and spatz_pkg carry the vector type and geometry definitions. An
+  # integration whose core complex is a single file for both the scalar and the
+  # vector build imports them unconditionally -- a generate branch does not stop
+  # vlog from having to resolve the package -- so they cannot sit behind
+  # `target: spatz`. Compiling two extra packages in a build that instantiates no
+  # Spatz costs nothing.
+  - files:
+    - hw/src/rvv_pkg.sv
+    - hw/src/generated/spatz_pkg.sv
+
   - target: spatz
     files:
     # Level 0
     - hw/src/reorder_buffer.sv
-    - hw/src/rvv_pkg.sv
     # Level 1
-    - hw/src/generated/spatz_pkg.sv
     - hw/src/spatz_serdiv.sv
     # Level 2
     - hw/src/spatz_decoder.sv
