@@ -2068,6 +2068,10 @@ module spatz_vlsu
   // per core at window close. Cycle-accounting identity (verified exactly): win = pair_commit +
   // wait_beats + no_insn + store/residual + vrf_bp. wait_beats is VLSU OCCUPANCY, not
   // critical-path exposure (it overlaps VFU compute) -- see docs/matmul_bottleneck_report.md §5.
+`ifdef SPATZ_VPERF
+  // Reaches the testbench by absolute path (mempool_tb.csr_trace_any_global), so it only
+  // elaborates in an integration whose testbench exports that window signal. Off by
+  // default keeps the IP self-contained; define SPATZ_VPERF to restore it.
   if (1) begin : gen_vperf
     logic        vperf_win_q;
     logic [31:0] c_win, c_insn, c_noinsn, c_pairok, c_single, c_waitbeat, c_vrfbp, c_reqstall, c_ret;
@@ -2166,6 +2170,7 @@ module spatz_vlsu
       end
     end
   end
+`endif
 `endif
 `endif
 
