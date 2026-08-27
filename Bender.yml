@@ -157,9 +157,15 @@ sources:
     # Level 5
     - hw/src/spatz.sv
     # Level 6
-    - target: mempool
-      files:
-      - hw/ip/spatz_cc/src/spatz_mempool_cc.sv
+    # TeraNoC (monster) inlines the MemPool core complex into its own
+    # hardware/src/mempool_cc.sv, so it never instantiates this file -- but vlog
+    # still compiles it, and it reads snitch_pkg::MaxBurstWords /
+    # ::BurstLenWidth, which exist only in the integration this file belongs to.
+    # Keep the SOURCE for that integration and drop it from the compile here.
+    # Revert this commit to restore the original manifest.
+    # - target: mempool
+    #   files:
+    #   - hw/ip/spatz_cc/src/spatz_mempool_cc.sv
 
 
   ## hw/ip/spatz_cc ##
