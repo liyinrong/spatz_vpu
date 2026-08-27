@@ -104,6 +104,7 @@ module spatz_fpu_sequencer
     .ZERO_REG_ZERO (0           )
   ) i_fpr (
     .clk_i  (clk_i    ),
+    .rst_ni (rst_ni   ),
     .raddr_i(fpr_raddr),
     .rdata_o(fpr_rdata),
     .waddr_i(fpr_waddr),
@@ -514,6 +515,7 @@ module spatz_fpu_sequencer
 
   logic [DataWidth-1:0] fp_lsu_pdata;
   logic [4:0]           fp_lsu_ptag;
+  logic                 fp_lsu_pwrite;
   logic                 fp_lsu_pvalid;
   logic                 fp_lsu_pready;
 
@@ -529,17 +531,14 @@ module spatz_fpu_sequencer
 
   snitch_lsu #(
     .NaNBox             (1                  ),
-    .dreq_t             (dreq_t             ),
-    .drsp_t             (drsp_t             ),
-    .DataWidth          (FLEN               ),
     .NumOutstandingLoads(NumOutstandingLoads)
   ) i_fp_lsu (
     .clk_i        (clk_i           ),
-    .rst_i        (~rst_ni         ),
+    .rst_ni       (rst_ni          ),
     // Request interface
     .lsu_qtag_i   (fp_lsu_qtag     ),
-    .lsu_qwrite_i (fp_lsu_qwrite   ),
-    .lsu_qsigned_i(fp_lsu_qsigned  ),
+    .lsu_qwrite   (fp_lsu_qwrite   ),
+    .lsu_qsigned  (fp_lsu_qsigned  ),
     .lsu_qaddr_i  (fp_lsu_qaddr    ),
     .lsu_qdata_i  (fp_lsu_qdata    ),
     .lsu_qsize_i  (fp_lsu_qsize    ),
@@ -551,6 +550,7 @@ module spatz_fpu_sequencer
     .lsu_ptag_o   (fp_lsu_ptag     ),
     .lsu_perror_o (/* Unused */    ),
     .lsu_pvalid_o (fp_lsu_pvalid   ),
+    .lsu_pwrite_o (fp_lsu_pwrite   ),
     .lsu_pready_i (fp_lsu_pready   ),
     .lsu_empty_o  (/* unused */    ),
     // Memory interface
