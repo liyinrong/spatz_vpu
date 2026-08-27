@@ -22,11 +22,9 @@
 //   granted window for the requester's own per-id bookkeeping. BlockWords==1 is the
 //   feature-absent default: every added statement const-folds out.
 //
-// SPATZ_ROB_CNT_IDVALID (default OFF, docs/spatz_mlp_design_plan.md §5.2 / R1):
-// derive id_valid_o from the occupancy counter instead of the id_valid_q free-id
-// bitmap. OFF elaborates the legacy bitmap unchanged (bit-identical). ON is a
-// deliberate netlist change: it deletes the NumWords bitmap flops, their write-
-// pointer decoder, the two NumWords:1 read muxes and write_next_ptr.
+// id_valid_o is derived from the occupancy counter. Ids are allocated and freed
+// strictly in order, so a free-id bitmap would be a redundant encoding of
+// status_cnt_q -- see the derivation at the assign below.
 
 module reorder_buffer
   import cf_math_pkg::idx_width;
@@ -82,12 +80,6 @@ module reorder_buffer
    *  Parameters  *
    ****************/
 
-  // R1: free-id tracking from status_cnt_q instead of the id_valid_q bitmap.
-  // 0 = legacy bitmap (default, bit-identical); 1 = counter compare.
-  localparam int unsigned CntIdValid =
-    `ifdef SPATZ_ROB_CNT_IDVALID `SPATZ_ROB_CNT_IDVALID
-    `else 0 `endif;
-
   // Split point of every id for the window compare: i = {i_hi, i_lo} at bit log2(BlockWords).
   // (IdWidth-1 coincides with idx_width(BlockWords) only when BlockWords == NumWords/2; at
   // NumWords=64/BlockWords=16 the window is a QUARTER of the ring and the split moves to bit 4.)
@@ -102,10 +94,7 @@ module reorder_buffer
 
   id_t              read_pointer_d, read_pointer_q;
   id_t              read_next_ptr;
-  id_t              write_pointer_d, write_pointer_q, write_next_ptr;
-
-  // Used to see which ID is available (legacy form only: not instantiated under CntIdValid)
-  logic [NumWords-1:0] id_valid_d, id_valid_q;
+  id_t              write_pointer_d, write_pointer_q;
   // Keep track of the ROB utilization
   logic [IdWidth:0] status_cnt_d, status_cnt_q;
 
@@ -132,21 +121,18 @@ module reorder_buffer
   assign id_read_o = read_pointer_q;
   assign read_next_ptr  = read_pointer_q + 1;
 
-  // "Are the next two ids free?" (the VLSU burst allocator demands two, see its
+  // "Are the next two ids free?" -- the VLSU burst allocator demands two (see its
   // rob_id_valid use). Ids are allocated and freed strictly in order, so the allocated
   // set is always the contiguous ring [read_pointer_q, write_pointer_q) whose cardinality
-  // *is* status_cnt_q (checked by cnt_ptr_coherent below). The bitmap lookup therefore
-  // equals the compare below at both boundaries: at cnt == NumWords-1 the only free slot
-  // is write_pointer_q itself, so write_next_ptr == read_pointer_q is still allocated -> 0,
-  // and (NumWords-1 <= NumWords-2) == 0; at cnt == NumWords (full) both are 0.
-  // write_next_ptr has no other consumer, so it is tied off (folds away) under CntIdValid.
-  if (CntIdValid) begin : gen_id_valid_cnt
-    assign write_next_ptr = '0;
-    assign id_valid_o     = (status_cnt_q <= (NumWords - 2));
-  end else begin : gen_id_valid_map
-    assign write_next_ptr = write_pointer_q + 1;
-    assign id_valid_o     = id_valid_q[write_pointer_q] & id_valid_q[write_next_ptr];
-  end
+  // *is* status_cnt_q (checked by cnt_ptr_coherent below). Writing cnt for status_cnt_q
+  // and N for NumWords, a free-id bitmap would give
+  //   bitmap[write_pointer_q]   = (cnt != N)                  -- wp is outside [rp, wp)
+  //                                                              unless the ring is full
+  //   bitmap[write_pointer_q+1] = ((cnt + 1) mod N) >= cnt     -- false only at cnt == N-1,
+  //                                                              where wp+1 wraps onto rp
+  // whose conjunction is exactly (cnt <= N-2). The bitmap is therefore a redundant
+  // encoding of the counter, and this is the counter form.
+  assign id_valid_o = (status_cnt_q <= (NumWords - 2));
 
   // Room for a WHOLE block. The NON-STRICT <= is load-bearing, not stylistic
   // (docs/spatz_mlp_design_plan.md §4/T3): after the first burst of a two-burst load
@@ -207,7 +193,6 @@ module reorder_buffer
     status_cnt_d    = status_cnt_q;
     mem_d           = mem_q;
     valid_d         = valid_q;
-    id_valid_d      = id_valid_q;
 
     // Output data
     data_o  = mem_q[read_pointer_q];
@@ -225,8 +210,6 @@ module reorder_buffer
       // arithmetic wraps naturally; with BlockWords == NumWords/2 this is one inverter on
       // the pointer msb, cheaper than the +1 incrementer it parallels.
       write_pointer_d = id_t'(write_pointer_q + BlockWords);
-      // The whole window becomes allocated at once (bitmap removed under CntIdValid).
-      if (!CntIdValid) id_valid_d = id_valid_q & ~block_mask;
       status_cnt_d = status_cnt_q + BlockWords;
     // Request an ID.
     end else if (id_req_i && !full_o) begin
@@ -236,8 +219,6 @@ module reorder_buffer
       end else begin
         write_pointer_d = write_pointer_q + 1;
       end
-      // Bitmap decoder (write side): removed under CntIdValid.
-      if (!CntIdValid) id_valid_d[write_pointer_q] = 1'b0;
       // Increment the overall counter
       status_cnt_d = status_cnt_q + 1;
     end
@@ -267,8 +248,6 @@ module reorder_buffer
     if (pop_i && valid_o) begin
       // Word was consumed
       valid_d[read_pointer_q] = 1'b0;
-      // Mark ID as available (bitmap decoder, read side: removed under CntIdValid)
-      if (!CntIdValid) id_valid_d[read_pointer_q] = 1'b1;
 
       // Increment the read pointer
       if (read_pointer_q == NumWords-1)
@@ -288,7 +267,7 @@ module reorder_buffer
     // -1 from the pop. Placed AFTER the single-id fixup so the block wins if both were
     // somehow requested -- the same priority the allocation above uses. The popped id can
     // never lie inside the window (room_block_o bounds the occupancy so read_pointer_q sits
-    // at or beyond wp+BlockWords), and the pop's id_valid_d set below runs later anyway.
+    // at or beyond wp+BlockWords), and the pop's counter update below runs later anyway.
     if (block_fire && (pop_i && valid_o)) begin
       status_cnt_d = status_cnt_q + BlockWords - 1;
     end
@@ -299,10 +278,6 @@ module reorder_buffer
       valid_d[read_pointer_q]    = 1'b0;
       valid_d[read_next_ptr]     = 1'b0;
       // read_next_ptr itself stays: it also feeds valid_d / data2_o above.
-      if (!CntIdValid) begin
-        id_valid_d[read_pointer_q] = 1'b1;
-        id_valid_d[read_next_ptr]  = 1'b1;
-      end
       read_pointer_d             = id_t'(read_pointer_q + 2);
       status_cnt_d               = status_cnt_q - 2;
       if (id_req_i && !full_o) begin
@@ -332,21 +307,6 @@ module reorder_buffer
     end
   end
 
-  // Legacy free-id bitmap flops. Under CntIdValid nothing reads id_valid_q (id_valid_o
-  // is derived from status_cnt_q), so the NumWords flops are not instantiated at all;
-  // the constant tie-off keeps the net driven for lint/waveforms and const-folds away.
-  if (CntIdValid) begin : gen_id_valid_ff_none
-    assign id_valid_q = '1;
-  end else begin : gen_id_valid_ff
-    always_ff @(posedge clk_i or negedge rst_ni) begin
-      if (!rst_ni) begin
-        // By default, all IDs are available
-        id_valid_q <= '1;
-      end else begin
-        id_valid_q <= id_valid_d;
-      end
-    end
-  end
 
   /****************
    *  Assertions  *
@@ -393,7 +353,7 @@ module reorder_buffer
       @(posedge clk_i) disable iff (!rst_ni) ((pop_i || pop_dual_i) |-> !empty_o))
   else $fatal (1, "ROB pop while empty: status_cnt_q would underflow.");
 
-  // A7: the invariant the CntIdValid form of id_valid_o rests on -- ids are allocated
+  // A7: the invariant id_valid_o rests on -- ids are allocated
   // and freed strictly in order, so the occupancy counter and the (write - read) ring
   // distance always agree mod NumWords, and the counter never exceeds NumWords. Armed
   // in both elaborations (sim-only): it validates the legacy build before the knob is
