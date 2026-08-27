@@ -41,7 +41,7 @@ module reorder_buffer
   // to reduce "(i - wp) mod NumWords < BlockWords" to a single msb test (checked below).
   parameter int unsigned BlockWords = 1,
   // Dependant parameters. Do not change!
-  parameter IdWidth                 = idx_width(NumWords),
+  parameter int unsigned IdWidth    = idx_width(NumWords),
   parameter type data_t             = logic [DataWidth-1:0],
   parameter type id_t               = logic [IdWidth-1:0]
 ) (
