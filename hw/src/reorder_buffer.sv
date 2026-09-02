@@ -125,17 +125,10 @@ module reorder_buffer
   // rob_id_valid use). Ids are allocated and freed strictly in order, so the allocated
   // set is always the contiguous ring [read_pointer_q, write_pointer_q) whose cardinality
   // *is* status_cnt_q (checked by cnt_ptr_coherent below). Writing cnt for status_cnt_q
-  // and N for NumWords, a free-id bitmap would give
-  //   bitmap[write_pointer_q]   = (cnt != N)                  -- wp is outside [rp, wp)
-  //                                                              unless the ring is full
-  //   bitmap[write_pointer_q+1] = ((cnt + 1) mod N) >= cnt     -- false only at cnt == N-1,
-  //                                                              where wp+1 wraps onto rp
-  // whose conjunction is exactly (cnt <= N-2). The bitmap is therefore a redundant
-  // encoding of the counter, and this is the counter form.
   assign id_valid_o = (status_cnt_q <= (NumWords - 2));
 
   // Room for a WHOLE block. The NON-STRICT <= is load-bearing, not stylistic
-  // (docs/spatz_mlp_design_plan.md §4/T3): after the first burst of a two-burst load
+  //: after the first burst of a two-burst load
   // handshakes, status_cnt_q is EXACTLY NumWords-BlockWords, so a strict < would silently
   // re-serialise the second burst -- and the symptom is "the change did nothing", not a
   // failure. Note this compares against a COMPILE-TIME CONSTANT, never against a requested
@@ -149,15 +142,6 @@ module reorder_buffer
   // id at the BlkLoW bit into {i_hi, i_lo}; then
   //   (i - wp) mod NumWords < BlockWords
   //     <=> (i_hi == wp_hi && i_lo >= wp_lo) || (i_hi == wp_hi+1 && i_lo < wp_lo)
-  // (wp_hi1 wraps mod 2^QSelW in the QSelW-bit sum, so the window crosses the ring top for
-  // free). blk_lt is the shared "i_lo < wp_lo" thermometer decode; its complement gives
-  // "i_lo >= wp_lo". At QSelW == 1 (BlockWords == NumWords/2, the legacy 32/16 shape) wp_hi1
-  // == ~wp_hi and this reduces BIT-IDENTICALLY to the shipped msb-XOR form:
-  //   q=0: (eq?~blk_lt:blk_lt) with eq=~wp4, eq1=wp4 -> ~(wp4 ^ blk_lt)
-  //   q=1: (eq?~blk_lt:blk_lt) with eq=wp4, eq1=~wp4 ->  (wp4 ^ blk_lt)
-  // i.e. ~(i_hi ^ wp_hi ^ lt) per id. ~3 levels, and OFF the request cone (only consumers are
-  // burst_odd_expected bookkeeping and an assertion -- grep-verified). Deliberately NOT a
-  // variable left shift: that is a 4-stage barrel shifter, ~160 GE / 4 levels (correction C1).
   if (BlockWords > 1) begin : gen_block_mask
     assign wp_lo  = write_pointer_q[BlkLoW-1:0];
     assign wp_hi  = write_pointer_q[IdWidth-1:BlkLoW];
