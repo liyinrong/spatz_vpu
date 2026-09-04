@@ -69,6 +69,10 @@ module reorder_buffer
   // when a burst's last row does not cover every lane, which is what lets one base id
   // describe the whole burst.
   input  logic  id_dummy_i,
+  // Block grant only: how many ids at the END of the granted window carry no beat.
+  // A burst reserves a whole window in one cycle, but a short burst does not fill it;
+  // those trailing ids are marked here exactly as a walked dummy would be.
+  input  logic [IdWidth:0] id_dummy_cnt_i,
   output logic  dummy_o,     // the current head is a dummy: pop it, do not consume it
   output id_t   id_o,
   output logic  id_valid_o,  // is the next id valid?
@@ -204,6 +208,12 @@ module reorder_buffer
       // the pointer msb, cheaper than the +1 incrementer it parallels.
       write_pointer_d = id_t'(write_pointer_q + BlockWords);
       status_cnt_d = status_cnt_q + BlockWords;
+      // Pre-fill the window's trailing dummies so the in-order head passes over them.
+      for (int j = 0; j < BlockWords; j++)
+        if (j >= (BlockWords - int'(id_dummy_cnt_i))) begin
+          valid_d[id_t'(write_pointer_q + j)] = 1'b1;
+          dummy_d[id_t'(write_pointer_q + j)] = 1'b1;
+        end
     // Request an ID.
     end else if (id_req_i && !full_o) begin
       // Increment the write pointer
