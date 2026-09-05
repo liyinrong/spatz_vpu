@@ -373,6 +373,7 @@ module spatz_vlsu
   // block_mask_o is the granted window [rob_id, rob_id+BlockWords) as a bitmap, consumed here
   // only by the odd-expected bookkeeping. All const 0 when the knob is off.
   logic  [NrMemPorts-1:0]                         rob_req_block;
+  logic  [NrMemPorts-1:0]                         rob_blk_req;
   logic  [NrMemPorts-1:0]                         rob_room_block;
   logic  [NrMemPorts-1:0][NrOutstandingLoads-1:0] rob_block_mask;
   // Ids at the end of a granted window that this lane's burst does not reach.
@@ -831,9 +832,17 @@ module spatz_vlsu
   // burst). ~4 levels, and deliberately WITHOUT the combinational burst_use guard, whose
   // ~25-level arrival is exactly what made the naive placement slow.
   for (genvar port = 0; port < NrMemPorts; port++) begin : gen_rob_req_block
-    assign rob_req_block[port] = (BlockWords > 1) &&
-                                 burst_alloc_q[port] && !burst_reserved_q &&
-                                 (burst_alloc_cnt_q[port] == '0);
+    // A full window only. A tail consumes the window unevenly, so it falls back to
+    // the walk (at most BlockWords-1 cycles) instead of reserving a block it cannot fill.
+    assign rob_blk_req[port] = (BlockWords > 1) &&
+                               burst_alloc_q[port] && !burst_reserved_q &&
+                               (burst_alloc_cnt_q[port] == '0) &&
+                               (burst_total_q == BurstLenWidth'(MaxBurstWords));
+    // The ROBs are driven by the ALL-PORTS decision, not by their own request. The
+    // reorder_buffer commits its pointer on its own id_req_block_i && room_block_o; if a
+    // port asserted its own request while another port lacked room, that ROB would advance
+    // while the VLSU's burst_block_fire stayed low and the two would diverge.
+    assign rob_req_block[port] = burst_block_fire;
   end : gen_rob_req_block
   // Term-for-term the reorder_buffer's own internal block_fire (id_req_block_i && room_block_o),
   // so the VLSU state update and the ROB pointer update commit together or not at all -- the
@@ -844,7 +853,7 @@ module spatz_vlsu
   always_comb begin
     burst_block_fire = (BlockWords > 1);
     for (int port = 0; port < NrMemPorts; port++)
-      burst_block_fire &= rob_req_block[port] && rob_room_block[port];
+      burst_block_fire &= rob_blk_req[port] && rob_room_block[port];
   end
 
   // Burst load element/lane tracking (port0 only).
