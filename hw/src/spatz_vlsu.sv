@@ -1482,8 +1482,14 @@ module spatz_vlsu
       // Response used
       // Decrement only for beats that were already pending before this cycle.
       // This avoids stale ROB cleanup pops canceling freshly-issued load beats.
+      // !rob_dummy: a dummy was never CHARGED (the charge counts a request's real beats,
+      // burst_port_share), so letting its drain decrement here breaks the one-charge-
+      // one-decrement invariant. With a single instruction in flight the blanket clear at
+      // the next push hides the drift; once instructions overlap that clear is skipped and
+      // the error accumulates until mem_pending reads zero with beats still owed -- and
+      // rob_push then DROPS the arriving beats.
       if (commit_insn_q.is_load && rob_rvalid[port] && rob_pop[port] &&
-          (mem_pending_q[port] != '0))
+          !rob_dummy[port] && (mem_pending_q[port] != '0))
         mem_pending_d[port]--;
 
       // TwinROB0 dual pop consumes two beats of the port-0 charge in one cycle.
