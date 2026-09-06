@@ -348,6 +348,22 @@ module spatz_controller
   `FF(narrow_wide_q, narrow_wide_d, '0)
 
   // Did this narrowing instruction write to the VRF in the previous cycle?
+  // The VFU raises its response before its multi-cycle VRF write-back has finished, so
+  // releasing the instruction there frees the id while the write port is still writing.
+  // One bit per instruction, because with LMUL>=2 several VFU write-backs overlap and a
+  // single register would let the last writer win.
+  logic [NrParallelInstructions-1:0] vfu_rsp_pending_q, vfu_rsp_pending_d;
+  `FF(vfu_rsp_pending_q, vfu_rsp_pending_d, '0)
+
+  // Is the write port still writing this deferred instruction's data?
+  logic [NrParallelInstructions-1:0] vfu_wr_pending_match;
+  always_comb begin
+    for (int unsigned i = 0; i < NrParallelInstructions; i++)
+      vfu_wr_pending_match[i] = vfu_rsp_pending_q[i] &&
+                                sb_enable_i[SB_VFU_VD_WD] &&
+                                (sb_id_i[SB_VFU_VD_WD] == spatz_id_t'(i));
+  end
+
   logic [NrParallelInstructions-1:0] wrote_result_narrowing_q, wrote_result_narrowing_d;
   `FF(wrote_result_narrowing_q, wrote_result_narrowing_d, '0)
 
@@ -824,7 +840,8 @@ module spatz_controller
 
   always_comb begin: proc_next_insn_id
     // Maintain state
-    running_insn_d = running_insn_q;
+    running_insn_d    = running_insn_q;
+    vfu_rsp_pending_d = vfu_rsp_pending_q;
 
     // New instruction!
     // A vl=0 op retires with no response, so tracking it would never clear
@@ -832,9 +849,21 @@ module spatz_controller
         (spatz_req.vl != '0 || spatz_req.op_arith.is_reduction))
       running_insn_d[next_insn_id] = 1'b1;
 
-    // Finished a instruction
+    // Complete deferred releases first, so a response arriving this cycle cannot be
+    // cleared by the release of an older one.
+    for (int unsigned i = 0; i < NrParallelInstructions; i++) begin
+      if (vfu_rsp_pending_q[i] && !vfu_wr_pending_match[i]) begin
+        running_insn_d[i]    = 1'b0;
+        vfu_rsp_pending_d[i] = 1'b0;
+      end
+    end
+
+    // Finished a instruction. Hold the release while the write-back is still active.
     if (vfu_rsp_valid_i) begin
-      running_insn_d[vfu_rsp_i.id] = 1'b0;
+      if (!sb_enable_i[SB_VFU_VD_WD])
+        running_insn_d[vfu_rsp_i.id] = 1'b0;
+      else
+        vfu_rsp_pending_d[vfu_rsp_i.id] = 1'b1;
     end
     if (vlsu_rsp_valid_i) begin
       running_insn_d[vlsu_rsp_i.id] = 1'b0;
