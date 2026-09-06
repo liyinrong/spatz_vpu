@@ -21,7 +21,7 @@ package:
 
 dependencies:
   common_cells:       { git: "https://github.com/pulp-platform/common_cells.git",       version: 1.39.0         }
-  fpnew:              { git: "https://github.com/pulp-platform/cvfpu.git",              rev:     feature/cfmadd }
+  fpnew:              { git: "https://github.com/pulp-platform/cvfpu.git",              rev:     pulp-v0.3.0 }
   tech_cells_generic: { git: "https://github.com/pulp-platform/tech_cells_generic.git", version: 0.2.13         }
   # Provided by the integrating parent (TeraNoC reuses its own modified
   # packages; the paths resolve root-relative, exactly like the vendored
