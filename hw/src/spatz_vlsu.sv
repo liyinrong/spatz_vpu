@@ -323,6 +323,23 @@ module spatz_vlsu
   logic  [NrMemPorts-1:0] rob_req_dummy;
   logic  [NrMemPorts-1:0] rob_dummy;
   logic  [NrMemPorts-1:0] rob_id_valid;
+  logic  [NrMemPorts-1:0] rob_req_block;
+  logic  [NrMemPorts-1:0] rob_blk_req;
+  logic  [NrMemPorts-1:0] rob_room_block;
+  logic  [NrMemPorts-1:0][idx_width(NrOutstandingLoads):0] rob_block_dummy_cnt;
+  logic                   burst_block_fire;
+  logic                   burst_reserved_q, burst_reserved_d;
+
+  // The window a lane reserves is BlockWords wide, but this burst only reaches
+  // burst_port_share of it. The buffer marks the trailing ids dummies itself, which is
+  // what keeps the lanes level when the window is not filled.
+  for (genvar port = 0; port < NrMemPorts; port++) begin : gen_block_dummy_cnt
+    assign rob_block_dummy_cnt[port] =
+        (BlockWords > 1)
+          ? ((idx_width(NrOutstandingLoads)+1)'(BlockWords) -
+             (idx_width(NrOutstandingLoads)+1)'(burst_port_share(burst_len_calc[0], port)))
+          : '0;
+  end : gen_block_dummy_cnt
   id_t   [NrMemPorts-1:0] rob_id;
   logic  [NrMemPorts-1:0] rob_full;
   logic  [NrMemPorts-1:0] rob_empty;
@@ -365,7 +382,7 @@ module spatz_vlsu
       .NumWords  (NrOutstandingLoads),
       .NumWrPorts(1                 ),
       .NumRdPorts(1                 ),
-      .BlockWords(1                 )
+      .BlockWords(BlockWords        )
     ) i_reorder_buffer (
       .clk_i         (clk_i           ),
       .rst_ni        (rst_ni          ),
@@ -384,14 +401,14 @@ module spatz_vlsu
       .pop_dual_i    (1'b0            ),
       .id_req_i      (rob_req_id[port]),
       .id_dummy_i    (rob_req_dummy[port]),
-      .id_dummy_cnt_i('0              ),
+      .id_dummy_cnt_i(rob_block_dummy_cnt[port]),
       .dummy_o       (rob_dummy[port] ),
       .id_o          (rob_id[port]    ),
       .id_valid_o    (rob_id_valid[port]),
       .full_o        (rob_full[port]  ),
       .empty_o       (rob_empty[port] ),
-      .id_req_block_i(1'b0            ),
-      .room_block_o  (/* unused */    ),
+      .id_req_block_i(rob_req_block[port]),
+      .room_block_o  (rob_room_block[port]),
       .block_mask_o  (/* unused */    )
     );
 `else
@@ -1537,7 +1554,8 @@ module spatz_vlsu
         // A lane that has issued everything it owes still takes dummy ids until it has
         // allocated as many as lane 0, so the buffers stay level for the next burst.
         if (!mem_use_port0_burst && !mem_operation_valid[port] &&
-            (pad_bytes_q[port] != '0) && !rob_full[port] && rob_id_valid[port]) begin
+            (pad_bytes_q[port] != '0) && !rob_full[port] && rob_id_valid[port] &&
+            !rob_req_block[port]) begin
           pad_fire[port]      = 1'b1;
           rob_req_id[port]    = 1'b1;
           rob_req_dummy[port] = 1'b1;
@@ -1555,7 +1573,7 @@ module spatz_vlsu
 
         // Reserve this lane's ids for the burst. The walk runs while nothing is being
         // issued, so it is outside the request arms below.
-        if (burst_alloc_fire[port])
+        if (burst_alloc_fire[port] && !rob_req_block[port])
           rob_req_id[port] = 1'b1;
         // The final id of a lane the last row does not reach carries no beat. Marking it
         // a dummy keeps every lane's count at burst_rows(), which is what makes the one
@@ -1749,6 +1767,33 @@ module spatz_vlsu
   end
   // verilator lint_on LATCH
 
+  for (genvar port = 0; port < NrMemPorts; port++) begin : gen_rob_req_block
+    // A full window only. A tail consumes the window unevenly, so it falls back to the
+    // walk instead of reserving a block it cannot fill.
+    assign rob_blk_req[port] = (BlockWords > 1) &&
+                               burst_alloc_q[port] && !burst_reserved_q &&
+                               (burst_alloc_cnt_q[port] == '0) &&
+                               (burst_total_q == BurstLenWidth'(MaxBurstWords));
+    // The buffers are driven by the ALL-PORTS decision, not by their own request. A
+    // buffer commits its pointer on its own id_req_block_i && room_block_o, so a lane
+    // asserting its own request while another lacked room would advance alone and
+    // diverge from the reduction below.
+    assign rob_req_block[port] = burst_block_fire;
+  end : gen_rob_req_block
+
+  always_comb begin : proc_burst_block_fire
+    burst_block_fire = (BlockWords > 1);
+    for (int port = 0; port < NrMemPorts; port++)
+      burst_block_fire &= rob_blk_req[port] && rob_room_block[port];
+  end : proc_burst_block_fire
+
+  // One flop per core, and none at all when the feature is off.
+  if (BlockWords > 1) begin : gen_burst_reserved
+    `FF(burst_reserved_q, burst_reserved_d, 1'b0)
+  end else begin : gen_no_burst_reserved
+    assign burst_reserved_q = 1'b0;
+  end
+
   // Every lane has reserved its whole share, so the one burst request may go out.
   logic burst_alloc_ready;
   always_comb begin : proc_burst_alloc_ready
@@ -1769,6 +1814,7 @@ module spatz_vlsu
     burst_alloc_cnt_d = burst_alloc_cnt_q;
     burst_base_id_d   = burst_base_id_q;
     burst_total_d     = burst_total_q;
+    burst_reserved_d  = burst_reserved_q;
     burst_send        = '0;
     burst_alloc_fire  = '0;
 
@@ -1779,6 +1825,7 @@ module spatz_vlsu
         burst_len_d[port]       = '0;
         burst_alloc_cnt_d[port] = '0;
         burst_base_id_d[port]   = '0;
+        if ((BlockWords > 1) && (port == 0)) burst_reserved_d = 1'b0;
       end else begin
         // Start an allocation when port 0 becomes eligible. The decision is port 0's --
         // it is the only port that issues -- but EVERY port allocates, because every
@@ -1789,8 +1836,16 @@ module spatz_vlsu
           burst_len_d[port]       = burst_rows(burst_len_calc[0]);
           burst_alloc_cnt_d[port] = '0;
           burst_total_d           = burst_len_calc[0];
+        end else if (burst_block_fire) begin
+          // One cycle for the whole window: base and count land together, so the request
+          // reaches its handshake in decide -> reserve -> send rather than walking an id
+          // per cycle. The trailing ids this burst does not reach were marked dummies by
+          // the buffer itself, so the lanes stay level.
+          burst_base_id_d[port]   = rob_id[port];
+          burst_alloc_cnt_d[port] = burst_len_q[port];
+          if (port == 0) burst_reserved_d = 1'b1;
         end else if (burst_alloc_q[port] && (burst_alloc_cnt_q[port] < burst_len_q[port])) begin
-          // Walk the ids one per cycle. The block reservation replaces this loop.
+          // The walk, used whenever the window was not taken.
           if (!rob_full[port] && !offset_queue_full[port]) begin
             burst_alloc_fire[port] = 1'b1;
             if (burst_alloc_cnt_q[port] == '0)
@@ -1812,6 +1867,7 @@ module spatz_vlsu
           burst_len_d[port]       = '0;
           burst_alloc_cnt_d[port] = '0;
           burst_total_d           = '0;
+          if ((BlockWords > 1) && (port == 0)) burst_reserved_d = 1'b0;
         end
       end
     end
