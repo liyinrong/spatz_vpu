@@ -1032,24 +1032,89 @@ module spatz_vlsu
 
   assign vd_elem_id = (commit_counter_q[0] > vreg_start_0) ? commit_counter_q[0] >> $clog2(ELENB) : commit_counter_q[N_FU-1] >> $clog2(ELENB);
 
+  // Burst request state. One request on port 0 covers the whole transfer; every lane
+  // still reserves its share of the reorder-buffer ids, so all buffers advance together
+  // and a single base id describes the burst.
+  logic  [NrMemPorts-1:0]                    burst_mode_req;
+  logic  [NrMemPorts-1:0]                    burst_use;
+  logic  [NrMemPorts-1:0]                    burst_addr_aligned;
+  logic  [NrMemPorts-1:0][BurstLenWidth-1:0] burst_len_calc;
+  logic  [NrMemPorts-1:0][BurstLenWidth-1:0] burst_len_issue;
+  logic  [NrMemPorts-1:0]                    burst_alloc_q, burst_alloc_d;
+  logic  [NrMemPorts-1:0][BurstLenWidth-1:0] burst_len_q, burst_len_d;
+  logic  [NrMemPorts-1:0][BurstLenWidth-1:0] burst_alloc_cnt_q, burst_alloc_cnt_d;
+  id_t   [NrMemPorts-1:0]                    burst_base_id_q, burst_base_id_d;
+  logic  [NrMemPorts-1:0]                    burst_send;
+  logic  [NrMemPorts-1:0]                    burst_alloc_fire;
+  logic  [BurstLenWidth-1:0]                 burst_total_q, burst_total_d;
+  vlen_t [NrMemPorts-1:0]                    mem_max_elements;
+  vlen_t [NrMemPorts-1:0]                    mem_remaining_bytes;
+  vlen_t [NrMemPorts-1:0]                    mem_remaining_words;
+
+  logic exec_is_load;
+  assign exec_is_load = (state_q == VLSU_RunningLoad);
+
+  for (genvar port = 0; port < NrMemPorts; port++) begin : gen_burst_state
+    `FF(burst_alloc_q[port],     burst_alloc_d[port],     1'b0)
+    `FF(burst_len_q[port],       burst_len_d[port],       '0  )
+    `FF(burst_alloc_cnt_q[port], burst_alloc_cnt_d[port], '0  )
+    `FF(burst_base_id_q[port],   burst_base_id_d[port],   '0  )
+  end : gen_burst_state
+  `FF(burst_total_q, burst_total_d, '0)
+
   for (genvar port = 0; port < NrMemPorts; port++) begin: gen_mem_counter_proc
     // The total amount of elements we have to work through
     vlen_t max_elements, max_idx_elements;
 
     always_comb begin
-      // Default value
-      max_elements = (mem_spatz_req.vl >> $clog2(NrMemPorts*MemDataWidthB)) << $clog2(MemDataWidthB);
+      // Default value. In burst mode port 0 owns the whole transfer and the other
+      // ports own none of it: the beats are distributed on the way back, not on the
+      // way out, so only port 0 counts requests.
+      if (mem_use_port0_burst)
+        max_elements = (port == 0) ? mem_spatz_req.vl : '0;
+      else begin
+        max_elements = (mem_spatz_req.vl >> $clog2(NrMemPorts*MemDataWidthB)) << $clog2(MemDataWidthB);
 
-      if (NrMemPorts == 1)
-        max_elements = mem_spatz_req.vl;
+        if (NrMemPorts == 1)
+          max_elements = mem_spatz_req.vl;
+        else
+          if (mem_spatz_req.vl[$clog2(MemDataWidthB) +: $clog2(NrMemPorts)] > port)
+            max_elements += MemDataWidthB;
+          else if (mem_spatz_req.vl[$clog2(MemDataWidthB) +: $clog2(NrMemPorts)] == port)
+            max_elements += mem_spatz_req.vl[$clog2(MemDataWidthB)-1:0];
+      end
+      mem_max_elements[port]    = max_elements;
+
+      // How much of this port's share is still outstanding, in bytes and in whole words.
+      mem_remaining_bytes[port] = max_elements - mem_counter_q[port];
+      mem_remaining_words[port] = mem_remaining_bytes[port] >> $clog2(MemDataWidthB);
+
+      // A burst carries as many words as remain, capped at the configured maximum. A
+      // tail is simply a shorter burst; there is no separate tail phase.
+      burst_len_calc[port] = (mem_remaining_words[port] >= MaxBurstWords)
+                           ? BurstLenWidth'(MaxBurstWords)
+                           : BurstLenWidth'(mem_remaining_words[port]);
+
+      // The expander walks consecutive addresses from the request's base, so the base
+      // must be aligned to the burst's own span.
+      if (BurstAlignBits > MAXEW)
+        burst_addr_aligned[port] = (mem_req_addr[port][BurstAlignBits-1:MAXEW] == '0);
       else
-        if (mem_spatz_req.vl[$clog2(MemDataWidthB) +: $clog2(NrMemPorts)] > port)
-          max_elements += MemDataWidthB;
-        else if (mem_spatz_req.vl[$clog2(MemDataWidthB) +: $clog2(NrMemPorts)] == port)
-          max_elements += mem_spatz_req.vl[$clog2(MemDataWidthB)-1:0];
+        burst_addr_aligned[port] = 1'b1;
+
+      burst_mode_req[port] = mem_is_load && !mem_is_single_element_operation &&
+                             mem_use_port0_burst && burst_addr_aligned[port] &&
+                             (burst_len_calc[port] > 1) && (port == 0);
+      burst_use[port]      = burst_mode_req[port];
+      // While allocating, the request length is the burst that was reserved for.
+      burst_len_issue[port] = burst_alloc_q[port] ? burst_total_q : burst_len_calc[port];
 
       mem_operation_valid[port] = mem_spatz_req_valid && (max_elements != mem_counter_q[port]);
-      mem_operation_last[port]  = mem_operation_valid[port] && ((max_elements - mem_counter_q[port]) <= (mem_is_single_element_operation ? mem_single_element_size : MemDataWidthB));
+      mem_operation_last[port]  = mem_operation_valid[port] &&
+                                  ((max_elements - mem_counter_q[port]) <=
+                                   (mem_is_single_element_operation ? mem_single_element_size :
+                                    (burst_use[port] ? (burst_len_issue[port] * MemDataWidthB)
+                                                     : MemDataWidthB)));
       mem_counter_load[port]    = mem_spatz_req_ready;
       mem_counter_d[port]       = (mem_spatz_req.vstart >> $clog2(NrMemPorts*MemDataWidthB)) << $clog2(MemDataWidthB);
       if (NrMemPorts == 1)
@@ -1059,7 +1124,11 @@ module spatz_vlsu
           mem_counter_d[port] += MemDataWidthB;
         else if (mem_spatz_req.vstart[$clog2(MemDataWidthB) +: $clog2(NrMemPorts)] == port)
           mem_counter_d[port] += mem_spatz_req.vstart[$clog2(MemDataWidthB)-1:0];
-      mem_counter_delta[port] = !mem_operation_valid[port] ? 'd0 : mem_is_single_element_operation ? mem_single_element_size : mem_operation_last[port] ? (max_elements - mem_counter_q[port]) : MemDataWidthB;
+      mem_counter_delta[port] = !mem_operation_valid[port] ? 'd0 :
+                                mem_is_single_element_operation ? mem_single_element_size :
+                                mem_operation_last[port] ? (max_elements - mem_counter_q[port]) :
+                                burst_use[port] ? (burst_len_issue[port] * MemDataWidthB) :
+                                MemDataWidthB;
       mem_counter_en[port]    = spatz_mem_req_ready[port] && spatz_mem_req_valid[port];
       mem_counter_max[port]   = max_elements;
 
@@ -1574,6 +1643,74 @@ module spatz_vlsu
     end
   end
   // verilator lint_on LATCH
+
+  // Every lane has reserved its whole share, so the one burst request may go out.
+  logic burst_alloc_ready;
+  always_comb begin : proc_burst_alloc_ready
+    burst_alloc_ready = 1'b1;
+    for (int port = 0; port < NrMemPorts; port++)
+      // A lane whose share is zero is legitimately ready: a burst shorter than
+      // NrMemPorts words has no beat for the high lanes, and demanding a non-zero share
+      // from every port would deadlock every tail of 2..NrMemPorts-1 words.
+      burst_alloc_ready &= burst_alloc_q[port] &&
+                           (burst_alloc_cnt_q[port] == burst_len_q[port]);
+    // ...but the burst must still carry something.
+    burst_alloc_ready &= (burst_total_q != '0);
+  end : proc_burst_alloc_ready
+
+  always_comb begin : proc_burst_alloc
+    burst_alloc_d     = burst_alloc_q;
+    burst_len_d       = burst_len_q;
+    burst_alloc_cnt_d = burst_alloc_cnt_q;
+    burst_base_id_d   = burst_base_id_q;
+    burst_total_d     = burst_total_q;
+    burst_send        = '0;
+    burst_alloc_fire  = '0;
+
+    for (int port = 0; port < NrMemPorts; port++) begin
+      if (!exec_is_load) begin
+        // The burst machinery is load-only; clear any stale state before stores.
+        burst_alloc_d[port]     = 1'b0;
+        burst_len_d[port]       = '0;
+        burst_alloc_cnt_d[port] = '0;
+        burst_base_id_d[port]   = '0;
+      end else begin
+        // Start an allocation when port 0 becomes eligible. The decision is port 0's --
+        // it is the only port that issues -- but EVERY port allocates, because every
+        // reorder buffer receives a share of the beats.
+        if (!burst_alloc_q[port] && mem_operation_valid[0] && burst_use[0]) begin
+          burst_alloc_d[port]     = 1'b1;
+          // This lane's own share, so all buffers advance by the same number of ids.
+          burst_len_d[port]       = burst_rows(burst_len_calc[0]);
+          burst_alloc_cnt_d[port] = '0;
+          burst_total_d           = burst_len_calc[0];
+        end else if (burst_alloc_q[port] && (burst_alloc_cnt_q[port] < burst_len_q[port])) begin
+          // Walk the ids one per cycle. The block reservation replaces this loop.
+          if (!rob_full[port] && !offset_queue_full[port]) begin
+            burst_alloc_fire[port] = 1'b1;
+            if (burst_alloc_cnt_q[port] == '0)
+              burst_base_id_d[port] = rob_id[port];
+            burst_alloc_cnt_d[port] = burst_alloc_cnt_q[port] + 1'b1;
+          end
+        end
+
+        // One request covers every port's share, so it may only leave once every buffer
+        // holds its ids -- otherwise beats would arrive for a port with nowhere to put them.
+        burst_send[port] = burst_alloc_ready;
+
+        // Clear EVERY port's state on the one handshake. It exists only on port 0, so
+        // gating each port on its own would leave the others latched as allocated: they
+        // would never reserve for the next burst and port 0 would run ahead, diverging
+        // the allocators that the single base id depends on.
+        if (burst_send[0] && mem_req_lvalid[0] && spatz_mem_req_ready[0]) begin
+          burst_alloc_d[port]     = 1'b0;
+          burst_len_d[port]       = '0;
+          burst_alloc_cnt_d[port] = '0;
+          burst_total_d           = '0;
+        end
+      end
+    end
+  end : proc_burst_alloc
 
   // Create memory requests
   for (genvar port = 0; port < NrMemPorts; port++) begin : gen_mem_req
