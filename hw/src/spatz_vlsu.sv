@@ -285,23 +285,42 @@ module spatz_vlsu
   // All elements from one side to the other go through it.
   for (genvar port = 0; port < NrMemPorts; port++) begin : gen_rob
 `ifdef MEMPOOL_SPATZ
+    // The second write/read ports, the dummy entries and the block reservation are
+    // the burst path's; with no burst requester they stay tied off and the buffer
+    // behaves exactly as the single-port one it replaces.
     reorder_buffer #(
-      .DataWidth(ELEN              ),
-      .NumWords (NrOutstandingLoads)
+      .DataWidth (ELEN              ),
+      .NumWords  (NrOutstandingLoads),
+      .NumWrPorts(1                 ),
+      .NumRdPorts(1                 ),
+      .BlockWords(1                 )
     ) i_reorder_buffer (
-      .clk_i    (clk_i           ),
-      .rst_ni   (rst_ni          ),
-      .data_i   (rob_wdata[port] ),
-      .id_i     (rob_wid[port]   ),
-      .push_i   (rob_push[port]  ),
-      .data_o   (rob_rdata[port] ),
-      .valid_o  (rob_rvalid[port]),
-      .id_read_o(rob_rid[port]   ),
-      .pop_i    (rob_pop[port]   ),
-      .id_req_i (rob_req_id[port]),
-      .id_o     (rob_id[port]    ),
-      .full_o   (rob_full[port]  ),
-      .empty_o  (rob_empty[port] )
+      .clk_i         (clk_i           ),
+      .rst_ni        (rst_ni          ),
+      .data_i        (rob_wdata[port] ),
+      .id_i          (rob_wid[port]   ),
+      .push_i        (rob_push[port]  ),
+      .data2_i       ('0              ),
+      .id2_i         ('0              ),
+      .push2_i       (1'b0            ),
+      .data_o        (rob_rdata[port] ),
+      .valid_o       (rob_rvalid[port]),
+      .id_read_o     (rob_rid[port]   ),
+      .pop_i         (rob_pop[port]   ),
+      .data2_o       (/* unused */    ),
+      .valid2_o      (/* unused */    ),
+      .pop_dual_i    (1'b0            ),
+      .id_req_i      (rob_req_id[port]),
+      .id_dummy_i    (1'b0            ),
+      .id_dummy_cnt_i('0              ),
+      .dummy_o       (/* unused */    ),
+      .id_o          (rob_id[port]    ),
+      .id_valid_o    (/* unused */    ),
+      .full_o        (rob_full[port]  ),
+      .empty_o       (rob_empty[port] ),
+      .id_req_block_i(1'b0            ),
+      .room_block_o  (/* unused */    ),
+      .block_mask_o  (/* unused */    )
     );
 `else
     fifo_v3 #(
