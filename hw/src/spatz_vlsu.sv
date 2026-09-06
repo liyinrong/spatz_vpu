@@ -13,21 +13,14 @@ module spatz_vlsu
   import cf_math_pkg::idx_width; #(
     parameter int unsigned   NrMemPorts         = 1,
     parameter int unsigned   NrOutstandingLoads = 16,
-    // Usable tile resp ports for the 2-wide burst receive (TwinROB0). 1 = legacy
-    // single-beat receive (all TwinROB0 logic const-folds out, bit-identical netlist).
+    // Kept because the integration overrides it. Burst beats reach every reorder
+    // buffer by the ordinary word->port rule, so it selects no receive datapath.
     parameter int unsigned   NumRespPorts       = 1,
     // Memory request
     parameter  type          spatz_mem_req_t    = logic,
     parameter  type          spatz_mem_rsp_t    = logic,
     // Dependant parameters. DO NOT CHANGE!
-    localparam int  unsigned IdWidth            = idx_width(NrOutstandingLoads),
-    // Beats of one port-0 burst received per cycle (parity drain: even beats arrive on
-    // mem port 0, odd beats on mem port 1; both land in ROB0's single contiguous id range).
-    // TwinROB0 is gone: burst beats now reach every ROB by the ordinary word->port
-    // rule, so no port needs a second write/read port or parity bookkeeping. Pinned
-    // to 1 so every `BurstRecvPorts > 1` generate const-folds away. NumRespPorts is
-    // kept on the interface but no longer selects a receive datapath.
-    localparam int  unsigned BurstRecvPorts     = 1
+    localparam int  unsigned IdWidth            = idx_width(NrOutstandingLoads)
   ) (
     input  logic                            clk_i,
     input  logic                            rst_ni,
@@ -261,7 +254,6 @@ module spatz_vlsu
   assign mem_use_port0_burst     = use_port0_burst_req;
   assign commit_use_port0_burst  = commit_insn_q.use_port0_burst;
   // TwinROB0 2-wide commit window gate (assigned after the commit counters are declared).
-  logic commit_pair_active;
   assign mem_port_active =
       mem_use_port0_burst ? {{(NrMemPorts-1){1'b0}}, 1'b1} : {NrMemPorts{1'b1}};
   // A burst is distributed across the ROBs by the ordinary word->port rule, so every
@@ -388,31 +380,6 @@ module spatz_vlsu
           : '0;
   end : gen_block_dummy_cnt
 
-  // TwinROB0 (2-wide burst receive): ROB0 gains a second slot-addressed write port (odd burst
-  // beats arriving on mem port 1 are steered into ROB0's own id range) and a second in-order
-  // read head + dual pop (2 elements/cycle commit). All '0/unused when BurstRecvPorts == 1.
-  elen_t [NrMemPorts-1:0] rob_wdata2;
-  id_t   [NrMemPorts-1:0] rob_wid2;
-  logic  [NrMemPorts-1:0] rob_push2;
-  elen_t [NrMemPorts-1:0] rob_rdata2;
-  logic  [NrMemPorts-1:0] rob_rvalid2;
-  logic  [NrMemPorts-1:0] rob_pop_dual;
-  // Which outstanding ROB0 ids are ODD burst beats (expected on mem port 1 under the MSHR's
-  // parity drain). Set at id allocation (alloc-walk cnt parity); cleared on ANY consuming push
-  // of that id (either port) -- so MSHR-bypassed / group-LOCAL bursts, whose beats all funnel
-  // to port 0 under the legacy contract, self-clear their odd bits (no delivery-contract mode
-  // exists to violate: the slots are the same either way).
-  logic  [NrOutstandingLoads-1:0] burst_odd_expected_d, burst_odd_expected_q;
-  `FF(burst_odd_expected_q, burst_odd_expected_d, '0)
-  // Beat-parity pattern for a block reservation. Beat k of a burst lands at id base+k and has
-  // parity k[0]; since (base+k)[0] == base[0] ^ k[0], the odd beats inside the window are
-  // exactly the ids whose LSB differs from base[0]. So this is a 2:1 mux between the two
-  // constants 0xAAAA.. and 0x5555.. -- one inverter's worth of logic, not a shifter.
-  logic  [NrOutstandingLoads-1:0] burst_odd_alt;
-  for (genvar i = 0; i < NrOutstandingLoads; i++) begin : gen_burst_odd_alt
-    assign burst_odd_alt[i] = (BlockWords > 1) ? (((i % 2) != 0) ^ rob_id[0][0]) : 1'b0;
-  end : gen_burst_odd_alt
-
   // This lane's final id carries no beat: request it as a dummy.
   logic [NrMemPorts-1:0] rob_req_dummy;
   // Non-burst padding: bytes this lane is short of lane 0 for the current instruction,
@@ -431,8 +398,6 @@ module spatz_vlsu
     reorder_buffer #(
       .DataWidth (ELEN              ),
       .NumWords  (NrOutstandingLoads),
-      .NumWrPorts(1),
-      .NumRdPorts(1),
       // Only ROB0 ever sees a block reservation (bursts are port-0 only): one instance of the
       // block logic per core, not four.
       .BlockWords(BlockWords)
@@ -442,16 +407,10 @@ module spatz_vlsu
       .data_i   (rob_wdata[port] ),
       .id_i     (rob_wid[port]   ),
       .push_i   (rob_push[port]  ),
-      .data2_i  (rob_wdata2[port]),
-      .id2_i    (rob_wid2[port]  ),
-      .push2_i  (rob_push2[port] ),
       .data_o   (rob_rdata[port] ),
       .valid_o  (rob_rvalid[port]),
       .id_read_o(rob_rid[port]   ),
       .pop_i    (rob_pop[port]   ),
-      .data2_o  (rob_rdata2[port]),
-      .valid2_o (rob_rvalid2[port]),
-      .pop_dual_i(rob_pop_dual[port]),
       .id_req_i (rob_req_id[port]),
       .id_dummy_i(rob_req_dummy[port]),
       .id_dummy_cnt_i(rob_block_dummy_cnt[port]),
@@ -484,8 +443,6 @@ module spatz_vlsu
     assign rob_rvalid[port] = !rob_empty[port];
     assign rob_id_valid[port] = 1'b1;
     assign rob_dummy[port]    = 1'b0;   // no dummy allocation without the reorder_buffer
-    assign rob_rdata2[port]  = '0;
-    assign rob_rvalid2[port] = 1'b0;
     // No block reservation without the reorder_buffer: room stays low, so burst_block_fire is
     // constant 0 and the legacy walk is always the active allocator here.
     assign rob_room_block[port] = 1'b0;
@@ -738,11 +695,6 @@ module spatz_vlsu
 `endif
     // pragma translate_on
   end: gen_vreg_counters
-
-  // TwinROB0 2-wide commit window: pairs only at even element offsets and never across the
-  // burst-region boundary (the tail region commits 1-wide legacy). An odd vstart self-aligns
-  // with one single commit. Const-folds to 0 when BurstRecvPorts == 1.
-  assign commit_pair_active = 1'b0;
 
   ////////////////////////
   // Address Generation //
@@ -1410,31 +1362,6 @@ module spatz_vlsu
     assign burst_reserved_q = 1'b0;
   end
 
-  // Odd-expected bitmap maintenance. SET by the burst id-allocation walk (beat cnt's id is odd
-  // iff cnt is odd -- the id itself may be either parity); CLEARED by any consuming push of that
-  // id on either port, which keeps it coherent when a burst is served under the legacy contract
-  // (group-LOCAL target or MSHR bypass: every beat funnels to port 0). Set wins over a same-cycle
-  // clear (an id can be freed and re-allocated in one cycle).
-  if (BurstRecvPorts > 1) begin : gen_burst_odd_expected
-    always_comb begin
-      burst_odd_expected_d = burst_odd_expected_q;
-      if (rob_push[0])
-        burst_odd_expected_d[rob_wid[0]]  = 1'b0;
-      if (rob_push2[0])
-        burst_odd_expected_d[rob_wid2[0]] = 1'b0;
-      if (mem_use_port0_burst && burst_alloc_fire[0])
-        burst_odd_expected_d[rob_id[0]]   = burst_alloc_cnt_q[0][0];
-      // Block reservation: all BlockWords parities are written in ONE cycle, the same cycle the
-      // ROB takes the window. Deliberately NOT gated on mem_use_port0_burst: the ROB allocates
-      // on burst_block_fire alone, and the bitmap must move with the ROB, never on a separate
-      // condition (that is the F2 divergence shape).
-      if ((BlockWords > 1) && burst_block_fire)
-        burst_odd_expected_d = (burst_odd_expected_d & ~rob_block_mask[0]) |
-                               ( rob_block_mask[0] & burst_odd_alt);
-    end
-  end else begin : gen_no_burst_odd_expected
-    assign burst_odd_expected_d = '0;
-  end
   always_comb begin
     // Maintain state
     mem_pending_d = mem_pending_q;
@@ -1484,12 +1411,6 @@ module spatz_vlsu
       if (commit_insn_q.is_load && rob_rvalid[port] && rob_pop[port] &&
           !rob_dummy[port] && (mem_pending_q[port] != '0))
         mem_pending_d[port]--;
-
-      // TwinROB0 dual pop consumes two beats of the port-0 charge in one cycle.
-      if ((BurstRecvPorts > 1) && (port == 0) &&
-          commit_insn_q.is_load && rob_pop_dual[0] &&
-          (mem_pending_q[0] >= 'd2))
-        mem_pending_d[0] = mem_pending_d[0] - 'd2;
     end
   end
 
@@ -1631,10 +1552,6 @@ module spatz_vlsu
     rob_req_id = '0;
     rob_req_dummy = '0;
     pad_fire      = '0;
-    rob_wdata2   = '0;
-    rob_wid2     = '0;
-    rob_push2    = '0;
-    rob_pop_dual = '0;
 
     mem_req_id     = '0;
     mem_req_data   = '0;
@@ -2115,16 +2032,6 @@ module spatz_vlsu
       else $fatal(1, "[spatz_vlsu] Block reservation and the legacy id walk fired in the same cycle.");
   end
 
-  if ((BlockWords > 1) && (BurstRecvPorts > 1)) begin : gen_block_odd_asserts
-    // A6 (blk_odd_clean): the window a reservation is about to take must carry no LIVE
-    // odd-expected bits. Otherwise a port-1 response for an OLD id is diverted into the new
-    // window -- wrong data in vd -- while ROB1's real entry never arrives and stalls it.
-    // room_block_o guarantees the window is unallocated; this checks the odd bitmap agrees.
-    assert property (@(posedge clk_i) disable iff (!rst_ni)
-        burst_block_fire |-> ((burst_odd_expected_q & rob_block_mask[0]) == '0))
-      else $fatal(1, "[spatz_vlsu] Block reservation window overlaps live odd-expected beats.");
-  end
-
 `ifdef TARGET_MEMPOOL
 `ifndef VERILATOR
   // [VPERF] kernel-window VLSU performance counters (permanent sim-only instrumentation; the
@@ -2139,7 +2046,7 @@ module spatz_vlsu
   // default keeps the IP self-contained; define SPATZ_VPERF to restore it.
   if (1) begin : gen_vperf
     logic        vperf_win_q;
-    logic [31:0] c_win, c_insn, c_noinsn, c_pairok, c_single, c_waitbeat, c_vrfbp, c_reqstall, c_ret;
+    logic [31:0] c_win, c_insn, c_noinsn, c_single, c_vrfbp, c_reqstall, c_ret;
     logic [31:0] c_dual, c_blkstall;
     // Request B (TeraNoC_gvsoc/ TIME AVERAGE of inflight_q, which the
     // existing counters cannot give. TWO denominators are emitted deliberately, because the model
@@ -2164,7 +2071,7 @@ module spatz_vlsu
     always_ff @(posedge clk_i or negedge rst_ni) begin
       if (!rst_ni) begin
         vperf_win_q <= 1'b0;
-        {c_win, c_insn, c_noinsn, c_pairok, c_single, c_waitbeat, c_vrfbp, c_reqstall, c_ret} <= '0;
+        {c_win, c_insn, c_noinsn, c_single, c_vrfbp, c_reqstall, c_ret} <= '0;
         {c_dual, c_blkstall} <= '0;
         {c_inflsum, c_actcyc} <= '0;
         {c_arr_words, c_arr_h1, c_arr_h2p, c_arr_cyc} <= '0;
@@ -2172,7 +2079,7 @@ module spatz_vlsu
       end else begin
         vperf_win_q <= vperf_win;
         if (vperf_win && !vperf_win_q) begin
-          {c_win, c_insn, c_noinsn, c_pairok, c_single, c_waitbeat, c_vrfbp, c_reqstall, c_ret} <= '0;
+          {c_win, c_insn, c_noinsn, c_single, c_vrfbp, c_reqstall, c_ret} <= '0;
         {c_dual, c_blkstall} <= '0;
         {c_inflsum, c_actcyc} <= '0;
         {c_arr_words, c_arr_h1, c_arr_h2p, c_arr_cyc} <= '0;
@@ -2191,11 +2098,8 @@ module spatz_vlsu
           if ($countones(rsp_load_valid) >  1) c_ld_h2p <= c_ld_h2p + 1;
           if (commit_insn_valid && commit_insn_q.is_load) c_insn <= c_insn + 1;
           if (!commit_insn_valid)                         c_noinsn <= c_noinsn + 1;
-          if (commit_pair_active && vrf_req_valid_d && vrf_req_ready_d) c_pairok <= c_pairok + 1;
-          if (commit_use_port0_burst && !commit_pair_active &&
+          if (commit_use_port0_burst &&
               vrf_req_valid_d && vrf_req_ready_d)         c_single <= c_single + 1;
-          if (commit_pair_active && mem_pending[0] &&
-              !(rob_rvalid[0] && rob_rvalid2[0]))         c_waitbeat <= c_waitbeat + 1;
           if (vrf_req_valid_d && !vrf_req_ready_d)        c_vrfbp <= c_vrfbp + 1;
           if (mem_req_lvalid[0] && !spatz_mem_req_ready[0]) c_reqstall <= c_reqstall + 1;
           if (commit_insn_pop)                            c_ret <= c_ret + 1;
@@ -2211,8 +2115,8 @@ module spatz_vlsu
         // first, and the second fires every cycle. That produced 3.8M lines / 1.0 GB before the
         // window even closed, and indentation made it look guarded.
         if (!vperf_win && vperf_win_q && (c_ret != 0)) begin
-          $display("[VPERF] %m win=%0d insn_act=%0d no_insn=%0d pair_commit=%0d single_commit=%0d wait_beats=%0d vrf_bp=%0d req_stall=%0d insn_ret=%0d dual_adv=%0d blk_stall=%0d infl_sum=%0d act_cyc=%0d",
-                   c_win, c_insn, c_noinsn, c_pairok, c_single, c_waitbeat, c_vrfbp, c_reqstall, c_ret, c_dual, c_blkstall, c_inflsum, c_actcyc);
+          $display("[VPERF] %m win=%0d insn_act=%0d no_insn=%0d single_commit=%0d vrf_bp=%0d req_stall=%0d insn_ret=%0d dual_adv=%0d blk_stall=%0d infl_sum=%0d act_cyc=%0d",
+                   c_win, c_insn, c_noinsn, c_single, c_vrfbp, c_reqstall, c_ret, c_dual, c_blkstall, c_inflsum, c_actcyc);
           $display("[VARRIVE] %m win=%0d arr_words=%0d arr_cyc=%0d arr_h1=%0d arr_h2p=%0d ports=%0d",
                    c_win, c_arr_words, c_arr_cyc, c_arr_h1, c_arr_h2p, NrMemPorts);
           $display("[VARRIVE-LD] %m win=%0d ld_words=%0d ld_cyc=%0d ld_h1=%0d ld_h2p=%0d ports=%0d",
@@ -2225,15 +2129,7 @@ module spatz_vlsu
 `endif
 `endif
 
-  if (BurstRecvPorts > 1) begin : gen_twinrob0_asserts
-    // The odd-expected classifier is sound because the mem op-queue serializes instructions
-    // until full retire: no native port-1 (strided/indexed) ROB1 allocation may be outstanding
-    // while odd burst beats are expected. A future Spatz change pipelining a second mem
-    // instruction into the FSM re-opens id aliasing -- this assertion is the tripwire.
-    assert property (@(posedge clk_i) disable iff (!rst_ni)
-        (|burst_odd_expected_q) |-> !rob_req_id[1])
-      else $fatal(1, "[spatz_vlsu] Native ROB1 allocation while odd burst beats are expected.");
-    if (Runahead) begin : gen_runahead_asserts
+  if (Runahead) begin : gen_runahead_asserts
     // A1: never advance the op queue mid-allocation (the walk-fallback window).
     assert property (@(posedge clk_i) disable iff (!rst_ni)
         (dual_adv && mem_spatz_req_ready) |-> !(|burst_alloc_q))
@@ -2256,11 +2152,6 @@ module spatz_vlsu
     assert property (@(posedge clk_i) disable iff (!rst_ni)
         mem_pending_q[0] <= NrOutstandingLoads)
       else $fatal(1, "[spatz_vlsu] mem_pending[0] exceeds the ROB id space.");
-    // A7: a 2-wide commit pop always has both beats charged.
-    assert property (@(posedge clk_i) disable iff (!rst_ni)
-        (commit_insn_q.is_load && rob_pop_dual[0]) |-> (mem_pending_q[0] >= 2))
-      else $fatal(1, "[spatz_vlsu] Dual ROB pop with fewer than two pending beats.");
-
     // A9 (fence underflow -- arm FIRST: a lost pulse hangs snitch acc_mem_req_cnt and
     // wedges the next gbar_sync). Exactly one spatz_mem_req_sent_o pulse per
     // push->pop interval of every instruction id.
@@ -2286,12 +2177,10 @@ module spatz_vlsu
     // ONLY: the stale-drain arm (rob_pop[0] with !mem_pending[0]) also pops ROB0 to discard
     // leftover entries from an earlier phase (e.g. warmup leftovers at the start of a load
     // phase) -- those are not commits and must not inflate the count. In the TwinROB0 pair
-    // branch rob_pop_dual is always a commit pop; in the legacy branch a commit pop has
-    // mem_pending[0] set.
+    // A commit pop has mem_pending[0] set.
     logic [15:0] head_pops_q, head_pops_d;
     always_comb begin
-      head_pops_d = head_pops_q + (rob_pop_dual[0] ? 16'd2 :
-                                   ((rob_pop[0] && mem_pending[0]) ? 16'd1 : 16'd0));
+      head_pops_d = head_pops_q + ((rob_pop[0] && mem_pending[0]) ? 16'd1 : 16'd0);
       if (commit_insn_pop) head_pops_d = '0;
     end
     always_ff @(posedge clk_i or negedge rst_ni) begin
@@ -2300,31 +2189,14 @@ module spatz_vlsu
     end
     a10_positional: assert property (@(posedge clk_i) disable iff (!rst_ni)
         (commit_insn_pop && commit_insn_q.is_load && commit_insn_q.use_port0_burst)
-        |-> (head_pops_q + (rob_pop_dual[0] ? 16'd2 :
-                            ((rob_pop[0] && mem_pending[0]) ? 16'd1 : 16'd0)))
+        |-> (head_pops_q + ((rob_pop[0] && mem_pending[0]) ? 16'd1 : 16'd0))
             == (16'(commit_insn_q.vl) >> 2))
       else $fatal(1, "[spatz_vlsu] H1 positional attribution broken: pops=%0d+%0d != vl_words=%0d at retire.",
                   head_pops_q,
-                  (rob_pop_dual[0] ? 16'd2 : ((rob_pop[0] && mem_pending[0]) ? 16'd1 : 16'd0)),
+                  ((rob_pop[0] && mem_pending[0]) ? 16'd1 : 16'd0),
                   (16'(commit_insn_q.vl) >> 2));
   end
 
-  if (!Runahead) begin : gen_retire_odd_assert
-      // Every expected odd beat must have been consumed by the time its instruction retires.
-      assert property (@(posedge clk_i) disable iff (!rst_ni)
-          (commit_insn_pop && commit_insn_q.use_port0_burst) |-> !(|burst_odd_expected_d))
-        else $fatal(1, "[spatz_vlsu] Burst instruction retiring with odd-expected bits still set.");
-    end else begin : gen_walk_odd_assert
-      // Under dual residency the form above FALSE-POSITIVES (A retires while B's odd bits
-      // legitimately live). Id-scoped sound form: an allocation may never target a live
-      // odd-expected id (blk_odd_clean covers the block path; this is the walk mirror).
-      // Disjoint id windows make aliasing structurally impossible; the native-ROB1
-      // tripwire above stays armed as the F5 backstop.
-      assert property (@(posedge clk_i) disable iff (!rst_ni)
-          burst_alloc_fire[0] |-> !burst_odd_expected_q[rob_id[0]])
-        else $fatal(1, "[spatz_vlsu] Walk allocation into a live odd-expected id.");
-    end
-  end
 `endif
 
 
