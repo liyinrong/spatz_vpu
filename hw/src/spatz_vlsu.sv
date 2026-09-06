@@ -320,6 +320,7 @@ module spatz_vlsu
   logic  [NrMemPorts-1:0] rob_pop;
   id_t   [NrMemPorts-1:0] rob_rid;
   logic  [NrMemPorts-1:0] rob_req_id;
+  logic  [NrMemPorts-1:0] rob_req_dummy;
   id_t   [NrMemPorts-1:0] rob_id;
   logic  [NrMemPorts-1:0] rob_full;
   logic  [NrMemPorts-1:0] rob_empty;
@@ -380,7 +381,7 @@ module spatz_vlsu
       .valid2_o      (/* unused */    ),
       .pop_dual_i    (1'b0            ),
       .id_req_i      (rob_req_id[port]),
-      .id_dummy_i    (1'b0            ),
+      .id_dummy_i    (rob_req_dummy[port]),
       .id_dummy_cnt_i('0              ),
       .dummy_o       (/* unused */    ),
       .id_o          (rob_id[port]    ),
@@ -1330,6 +1331,7 @@ module spatz_vlsu
     rob_push  = '0;
     rob_pop   = '0;
     rob_req_id = '0;
+    rob_req_dummy = '0;
 
     mem_req_id     = '0;
     mem_req_data   = '0;
@@ -1469,7 +1471,28 @@ module spatz_vlsu
         // data (load issue is RunningLoad-gated below), so draining is safe.
         if (state_q == VLSU_RunningStore && !rob_empty[port])
           rob_pop[port] = 1'b1;
-        if (!rob_full[port] && !offset_queue_full[port] && mem_operation_valid[port]) begin
+        // Reserve this lane's ids for the burst. The walk runs while nothing is being
+        // issued, so it is outside the request arms below.
+        if (burst_alloc_fire[port])
+          rob_req_id[port] = 1'b1;
+        // The final id of a lane the last row does not reach carries no beat. Marking it
+        // a dummy keeps every lane's count at burst_rows(), which is what makes the one
+        // base id valid; it drains without reaching the register file.
+        if (burst_alloc_fire[port] &&
+            (burst_alloc_cnt_q[port] == (burst_len_q[port] - BurstLenWidth'(1))) &&
+            (burst_port_share(burst_len_calc[0], port) < burst_len_q[port]))
+          rob_req_dummy[port] = 1'b1;
+
+        if (burst_use[port] && mem_operation_valid[port]) begin
+          // One request for the whole burst, addressed from the lane's base id. The
+          // memory expands it and returns each beat under its own id, so the response
+          // path needs no burst case.
+          if (burst_send[port]) begin
+            mem_req_lvalid[port] = (!mem_is_indexed || (vrf_rvalid_i[1] && mem_idx_word_ok[port])) && mem_spatz_req.op_mem.is_load && (state_q == VLSU_RunningLoad);
+            mem_req_id[port]     = burst_base_id_q[port];
+            mem_req_last[port]   = mem_operation_last[port];
+          end
+        end else if (!rob_full[port] && !offset_queue_full[port] && mem_operation_valid[port]) begin
           rob_req_id[port]     = spatz_mem_req_ready[port] & spatz_mem_req_valid[port];
 
           // If we have an index oepration, we ensure we are not fetching the next index
@@ -1733,9 +1756,8 @@ module spatz_vlsu
     assign spatz_mem_req[port].mode  = '0; // Request always uses user privilege level
     assign spatz_mem_req[port].size  = mem_spatz_req.vtype.vsew[1:0];
     assign spatz_mem_req[port].write = !mem_is_load;
-    // No burst path here yet: a length of zero is the single-word request the
-    // integration's burst adapter passes straight through.
-    assign spatz_mem_req[port].burst_len = '0;
+    // Zero is the single-word request the integration's burst adapter passes through.
+    assign spatz_mem_req[port].burst_len = burst_use[port] ? burst_len_issue[port] : '0;
     assign spatz_mem_req[port].strb  = mem_req_strb[port];
     assign spatz_mem_req[port].data  = mem_req_data[port];
     assign spatz_mem_req[port].last  = mem_req_last[port];
