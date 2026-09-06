@@ -15,6 +15,7 @@ module spatz_vlsu
 `endif
   import cf_math_pkg::idx_width; #(
     parameter int unsigned   NrMemPorts         = 1,
+    parameter int unsigned   NumRespPorts       = NrMemPorts,
     parameter int unsigned   NrOutstandingLoads = 8,
     // Memory request
     parameter  type          spatz_mem_req_t    = logic,
@@ -1505,6 +1506,9 @@ module spatz_vlsu
     assign spatz_mem_req[port].mode  = '0; // Request always uses user privilege level
     assign spatz_mem_req[port].size  = mem_spatz_req.vtype.vsew[1:0];
     assign spatz_mem_req[port].write = !mem_is_load;
+    // No burst path here yet: a length of zero is the single-word request the
+    // integration's burst adapter passes straight through.
+    assign spatz_mem_req[port].burst_len = '0;
     assign spatz_mem_req[port].strb  = mem_req_strb[port];
     assign spatz_mem_req[port].data  = mem_req_data[port];
     assign spatz_mem_req[port].last  = mem_req_last[port];
@@ -1527,6 +1531,10 @@ module spatz_vlsu
 
   if (MemDataWidth != ELEN)
     $error("[spatz_vlsu] The memory data width needs to be equal to %d.", ELEN);
+
+  if (NumRespPorts != NrMemPorts)
+    $error("[spatz_vlsu] NumRespPorts (%0d) must equal NrMemPorts (%0d) until the burst receive path is ported.",
+           NumRespPorts, NrMemPorts);
 
   if (NrMemPorts != N_FU)
     $error("[spatz_vlsu] The number of memory ports needs to be equal to the number of FUs.");

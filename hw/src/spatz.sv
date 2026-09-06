@@ -15,6 +15,11 @@
 
 module spatz import spatz_pkg::*; import rvv_pkg::*; import fpnew_pkg::*; #(
     parameter int                  unsigned NrMemPorts          = 1,
+    // Number of memory ports that receive the beats of one burst response. The
+    // burst receive path is not ported yet, so every port receives as usual and
+    // this must equal NrMemPorts; it is threaded through for the integration,
+    // which sizes it from its own topology.
+    parameter int                  unsigned NumRespPorts        = NrMemPorts,
     parameter bit                           RegisterRsp         = 0,
     // Memory request (VLSU)
     parameter type                          spatz_mem_req_t     = logic,
@@ -594,6 +599,7 @@ module spatz import spatz_pkg::*; import rvv_pkg::*; import fpnew_pkg::*; #(
 `else
   spatz_vlsu #(
     .NrMemPorts      (NrMemPorts      ),
+    .NumRespPorts    (NumRespPorts    ),
     .spatz_mem_req_t (spatz_mem_req_t ),
     .spatz_mem_rsp_t (spatz_mem_rsp_t )
   ) i_vlsu (
