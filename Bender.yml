@@ -21,11 +21,15 @@ sources:
   # integration whose core complex is one file for both the scalar and the vector
   # build imports them unconditionally -- a generate branch does not stop vlog from
   # having to resolve the package -- so they cannot sit behind `target: spatz`.
-  - files:
+  # When the opt-in upstream VPU profile is selected (-t spatz_upstream), the
+  # upstream spatz_vpu package provides rvv_pkg/spatz_pkg and this whole
+  # package must stay out of the compilation (same package and module names).
+  - target: not(spatz_upstream)
+    files:
     - hw/src/rvv_pkg.sv
     - hw/src/generated/spatz_pkg.sv
 
-  - target: spatz
+  - target: all(spatz, not(spatz_upstream))
     files:
     # Level 0
     - hw/src/reorder_buffer.sv
