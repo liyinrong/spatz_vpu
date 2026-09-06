@@ -67,6 +67,44 @@ module spatz_vlsu
   localparam int unsigned MemDataWidth  = ELEN;
   localparam int unsigned MemDataWidthB = MemDataWidth/8;
 
+  // Burst emission requires a memory system that EXPANDS a burst_len>1 request into
+  // burst_len responses. Against a plain word-granular memory the VLSU would charge
+  // mem_pending by burst_len, receive one beat and wait forever. Default off here:
+  // the integration turns it on where its burst adapter is present.
+  localparam bit BurstEn =
+    `ifdef SPATZ_VLSU_BURST `SPATZ_VLSU_BURST `else 0 `endif;
+
+  localparam int unsigned MaxBurstWords  = spatz_pkg::MaxBurstWords;
+  localparam int unsigned BurstLenWidth  = spatz_pkg::BurstLenWidth;
+  localparam int unsigned BurstAlignBits = $clog2(MaxBurstWords*MemDataWidthB);
+
+  // Rows a burst of `len` words occupies: ceil(len/NrMemPorts). EVERY lane allocates
+  // this many ids, so all reorder buffers advance by the same amount and ONE base id
+  // describes the whole burst. Lanes the last row does not reach take a dummy.
+  function automatic logic [BurstLenWidth-1:0] burst_rows
+      (input logic [BurstLenWidth-1:0] len);
+    burst_rows = BurstLenWidth'((len + BurstLenWidth'(NrMemPorts - 1)) >> $clog2(NrMemPorts));
+  endfunction
+
+  // Real beats lane `port` receives. Beat k goes to lane k % NrMemPorts, so lane p owns
+  // beats p, p+NrMemPorts, ... Differs from burst_rows only on the last row, and that
+  // difference is exactly the lane's dummy.
+  function automatic logic [BurstLenWidth-1:0] burst_port_share
+      (input logic [BurstLenWidth-1:0] len, input int unsigned port);
+    if (len > BurstLenWidth'(port))
+      burst_port_share = BurstLenWidth'((len - BurstLenWidth'(port) +
+                                         BurstLenWidth'(NrMemPorts - 1)) >> $clog2(NrMemPorts));
+    else
+      burst_port_share = '0;
+  endfunction
+
+  // Block reorder-buffer id reservation. 0 = the burst allocator walks its ids one per
+  // cycle; 1 = each lane takes its whole window in one cycle.
+  localparam int unsigned BlockAlloc =
+    `ifdef SPATZ_VLSU_BLOCK_ALLOC `SPATZ_VLSU_BLOCK_ALLOC `else 0 `endif;
+  localparam int unsigned BlockWords =
+      (BlockAlloc != 0) ? (MaxBurstWords / NrMemPorts) : 1;
+
   //////////////
   // Typedefs //
   //////////////
@@ -154,6 +192,37 @@ module spatz_vlsu
   logic mem_is_indexed;
   assign mem_is_indexed = mem_spatz_req_valid &&
                           ((mem_spatz_req.op == VLXE) || (mem_spatz_req.op == VSXE));
+
+  // Use only port 0 for aligned unit-stride vector loads (the burst path). Port 0
+  // issues one request covering the whole burst; the beats come back distributed over
+  // the lanes by the ordinary word->port rule, so every reorder buffer takes a share.
+  logic use_port0_burst_req;
+  logic mem_use_port0_burst;
+  logic commit_use_port0_burst;
+  logic [NrMemPorts-1:0] mem_port_active;
+  assign use_port0_burst_req =
+      BurstEn &&
+      mem_spatz_req.op_mem.is_load &&
+      !mem_is_strided &&
+      !mem_is_indexed &&
+      // Unmasked only. A burst carries no per-element predicate, and the beats are
+      // steered by address alone, so a masked operation must take the ordinary path.
+      mem_spatz_req.op_mem.vm &&
+      (mem_spatz_req.vl >= (2 * MemDataWidthB)) &&
+      // The whole transfer must fit in one reorder-buffer batch: a scoreboard-blocked
+      // VRF write would otherwise stop the buffers draining between batches. Each lane
+      // holds vl/NrMemPorts of the beats, so the ceiling is the whole buffer set.
+      (mem_spatz_req.vl <= (NrOutstandingLoads * MemDataWidthB * NrMemPorts)) &&
+      (mem_spatz_req.rs1[BurstAlignBits-1:0] == '0) &&
+      // vstart must be zero: a word's lane is its element index mod NrMemPorts counted
+      // from rs1, and the reply path derives the lane as beat index mod NrMemPorts.
+      // Those agree only when the burst starts on a multiple of NrMemPorts.
+      (mem_spatz_req.vstart == '0);
+  assign mem_use_port0_burst    = use_port0_burst_req;
+  assign commit_use_port0_burst = commit_insn_q.use_port0_burst;
+  // In burst mode only port 0 issues; the others take no request of their own.
+  assign mem_port_active =
+      mem_use_port0_burst ? {{(NrMemPorts-1){1'b0}}, 1'b1} : {NrMemPorts{1'b1}};
 
   /////////////
   //  State  //
@@ -428,6 +497,7 @@ module spatz_vlsu
     logic is_load;
     logic is_strided;
     logic is_indexed;
+    logic use_port0_burst;
   } commit_metadata_t;
 
   commit_metadata_t commit_insn_d;
@@ -466,7 +536,8 @@ module spatz_vlsu
       vm        : mem_spatz_req.op_mem.vm,
       is_load   : mem_spatz_req.op_mem.is_load,
       is_strided: mem_is_strided,
-      is_indexed: mem_is_indexed
+      is_indexed: mem_is_indexed,
+      use_port0_burst: use_port0_burst_req
   };
 
   assign spatz_req_ready_o = spatz_req_ready & !commit_insn_full;
