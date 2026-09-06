@@ -322,6 +322,7 @@ module spatz_vlsu
   logic  [NrMemPorts-1:0] rob_req_id;
   logic  [NrMemPorts-1:0] rob_req_dummy;
   logic  [NrMemPorts-1:0] rob_dummy;
+  logic  [NrMemPorts-1:0] rob_id_valid;
   id_t   [NrMemPorts-1:0] rob_id;
   logic  [NrMemPorts-1:0] rob_full;
   logic  [NrMemPorts-1:0] rob_empty;
@@ -386,7 +387,7 @@ module spatz_vlsu
       .id_dummy_cnt_i('0              ),
       .dummy_o       (rob_dummy[port] ),
       .id_o          (rob_id[port]    ),
-      .id_valid_o    (/* unused */    ),
+      .id_valid_o    (rob_id_valid[port]),
       .full_o        (rob_full[port]  ),
       .empty_o       (rob_empty[port] ),
       .id_req_block_i(1'b0            ),
@@ -824,6 +825,34 @@ module spatz_vlsu
   logic exec_is_load;
   assign exec_is_load = (state_q == VLSU_RunningLoad);
 
+  // Non-burst alignment padding. Only port 0 issues a burst, so the adapter gets ONE
+  // base id and derives every beat as base+beat. That is valid only while all lanes sit
+  // at the same buffer position, so any operation that advances the lanes unequally --
+  // a vl that is not a whole multiple of NrMemPorts words, an indexed or strided access,
+  // a store -- must pad the short lanes with dummy ids until they catch up.
+  logic [NrMemPorts-1:0][idx_width(ELENB+1)-1:0] pad_init;
+  logic [NrMemPorts-1:0][idx_width(ELENB+1)-1:0] pad_bytes_q, pad_bytes_d;
+  logic [idx_width(ELENB+1)-1:0]                 pad_step;
+  logic [NrMemPorts-1:0]                         pad_fire;
+
+  // The shortfall is counted down in the units the lanes fell behind in: a
+  // single-element operation moves one element per request, everything else a word.
+  assign pad_step = mem_is_single_element_operation
+                  ? (idx_width(ELENB+1))'(mem_single_element_size)
+                  : (idx_width(ELENB+1))'(ELENB);
+  always_comb begin
+    pad_bytes_d = pad_bytes_q;
+    for (int port = 0; port < NrMemPorts; port++) begin
+      // Reload at the instruction boundary, where mem_max_elements is the new op's.
+      if (mem_counter_load[port])
+        pad_bytes_d[port] = pad_init[port];
+      else if (pad_fire[port])
+        pad_bytes_d[port] = (pad_bytes_q[port] > pad_step) ? (pad_bytes_q[port] - pad_step)
+                                                           : '0;
+    end
+  end
+  `FF(pad_bytes_q, pad_bytes_d, '{default: '0})
+
   for (genvar port = 0; port < NrMemPorts; port++) begin : gen_burst_state
     `FF(burst_alloc_q[port],     burst_alloc_d[port],     1'b0)
     `FF(burst_len_q[port],       burst_len_d[port],       '0  )
@@ -1100,6 +1129,11 @@ module spatz_vlsu
             max_elements += mem_spatz_req.vl[$clog2(MemDataWidthB)-1:0];
       end
       mem_max_elements[port]    = max_elements;
+      // In burst mode the lanes are deliberately unequal (port 0 owns everything) and
+      // the burst's own dummies keep the buffers level, so nothing is owed here.
+      pad_init[port] = mem_use_port0_burst
+                     ? '0
+                     : (idx_width(ELENB+1))'(mem_max_elements[0] - mem_max_elements[port]);
 
       // How much of this port's share is still outstanding, in bytes and in whole words.
       mem_remaining_bytes[port] = max_elements - mem_counter_q[port];
@@ -1360,6 +1394,7 @@ module spatz_vlsu
     rob_pop   = '0;
     rob_req_id = '0;
     rob_req_dummy = '0;
+    pad_fire      = '0;
 
     mem_req_id     = '0;
     mem_req_data   = '0;
@@ -1499,6 +1534,25 @@ module spatz_vlsu
         // data (load issue is RunningLoad-gated below), so draining is safe.
         if (state_q == VLSU_RunningStore && !rob_empty[port])
           rob_pop[port] = 1'b1;
+        // A lane that has issued everything it owes still takes dummy ids until it has
+        // allocated as many as lane 0, so the buffers stay level for the next burst.
+        if (!mem_use_port0_burst && !mem_operation_valid[port] &&
+            (pad_bytes_q[port] != '0) && !rob_full[port] && rob_id_valid[port]) begin
+          pad_fire[port]      = 1'b1;
+          rob_req_id[port]    = 1'b1;
+          rob_req_dummy[port] = 1'b1;
+        end
+
+        // A remainder too short to burst stays on the word path, and that request
+        // advances ONLY lane 0. The other lanes must still take an id, or the buffers
+        // drift apart and the single base id the next burst derives from stops being
+        // valid. Port 0 is evaluated first in this loop, so its intent is settled here.
+        if (mem_use_port0_burst && (port != 0) && mem_req_lvalid[0] && !burst_send[0] &&
+            spatz_mem_req_ready[0]) begin
+          rob_req_id[port]    = 1'b1;
+          rob_req_dummy[port] = 1'b1;
+        end
+
         // Reserve this lane's ids for the burst. The walk runs while nothing is being
         // issued, so it is outside the request arms below.
         if (burst_alloc_fire[port])
