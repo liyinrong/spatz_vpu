@@ -374,14 +374,12 @@ module spatz_vlsu
   // All elements from one side to the other go through it.
   for (genvar port = 0; port < NrMemPorts; port++) begin : gen_rob
 `ifdef MEMPOOL_SPATZ
-    // The second write/read ports, the dummy entries and the block reservation are
-    // the burst path's; with no burst requester they stay tied off and the buffer
-    // behaves exactly as the single-port one it replaces.
+    // The dummy entries and the block reservation are the burst path's; with no
+    // burst requester they stay inert and the buffer behaves exactly as the one it
+    // replaces.
     reorder_buffer #(
       .DataWidth (ELEN              ),
       .NumWords  (NrOutstandingLoads),
-      .NumWrPorts(1                 ),
-      .NumRdPorts(1                 ),
       .BlockWords(BlockWords        )
     ) i_reorder_buffer (
       .clk_i         (clk_i           ),
@@ -389,16 +387,10 @@ module spatz_vlsu
       .data_i        (rob_wdata[port] ),
       .id_i          (rob_wid[port]   ),
       .push_i        (rob_push[port]  ),
-      .data2_i       ('0              ),
-      .id2_i         ('0              ),
-      .push2_i       (1'b0            ),
       .data_o        (rob_rdata[port] ),
       .valid_o       (rob_rvalid[port]),
       .id_read_o     (rob_rid[port]   ),
       .pop_i         (rob_pop[port]   ),
-      .data2_o       (/* unused */    ),
-      .valid2_o      (/* unused */    ),
-      .pop_dual_i    (1'b0            ),
       .id_req_i      (rob_req_id[port]),
       .id_dummy_i    (rob_req_dummy[port]),
       .id_dummy_cnt_i(rob_block_dummy_cnt[port]),
