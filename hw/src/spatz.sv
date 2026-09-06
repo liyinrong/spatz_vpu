@@ -597,11 +597,20 @@ module spatz import spatz_pkg::*; import rvv_pkg::*; import fpnew_pkg::*; #(
     .spatz_mem_str_finished_o(spatz_mem_str_finished                               )
   );
 `else
+  // The VLSU's reorder-buffer depth is not the scalar core's outstanding-load budget.
+  // It sizes how far the memory side may run ahead of the commit side: the VLSU releases
+  // an instruction once its requests are ISSUED, so a shallow buffer throttles that
+  // runahead on itself rather than on the memory system. Left at NumOutstandingLoads
+  // when the define is absent, so nothing changes for a build that does not set it.
+  localparam int unsigned NrVLSUOutstandingLoads =
+    `ifdef SPATZ_VLSU_ROB_DEPTH `SPATZ_VLSU_ROB_DEPTH `else NumOutstandingLoads `endif;
+
   spatz_vlsu #(
-    .NrMemPorts      (NrMemPorts      ),
-    .NumRespPorts    (NumRespPorts    ),
-    .spatz_mem_req_t (spatz_mem_req_t ),
-    .spatz_mem_rsp_t (spatz_mem_rsp_t )
+    .NrMemPorts        (NrMemPorts            ),
+    .NumRespPorts      (NumRespPorts          ),
+    .NrOutstandingLoads(NrVLSUOutstandingLoads),
+    .spatz_mem_req_t   (spatz_mem_req_t       ),
+    .spatz_mem_rsp_t   (spatz_mem_rsp_t       )
   ) i_vlsu (
     .clk_i                   (clk_i                                                ),
     .rst_ni                  (rst_ni                                               ),
