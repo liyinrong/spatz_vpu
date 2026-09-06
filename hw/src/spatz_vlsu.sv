@@ -321,6 +321,7 @@ module spatz_vlsu
   id_t   [NrMemPorts-1:0] rob_rid;
   logic  [NrMemPorts-1:0] rob_req_id;
   logic  [NrMemPorts-1:0] rob_req_dummy;
+  logic  [NrMemPorts-1:0] rob_dummy;
   id_t   [NrMemPorts-1:0] rob_id;
   logic  [NrMemPorts-1:0] rob_full;
   logic  [NrMemPorts-1:0] rob_empty;
@@ -383,7 +384,7 @@ module spatz_vlsu
       .id_req_i      (rob_req_id[port]),
       .id_dummy_i    (rob_req_dummy[port]),
       .id_dummy_cnt_i('0              ),
-      .dummy_o       (/* unused */    ),
+      .dummy_o       (rob_dummy[port] ),
       .id_o          (rob_id[port]    ),
       .id_valid_o    (/* unused */    ),
       .full_o        (rob_full[port]  ),
@@ -668,7 +669,14 @@ module spatz_vlsu
           default: offset = $signed(vrf_rdata_i[1][8 * word_index +: 32]);
         endcase
       end else begin
-        offset = ({mem_counter_q[port][$bits(vlen_t)-1:MAXEW] << $clog2(NrMemPorts), mem_counter_q[port][int'(MAXEW)-1:0]} + (port << MAXEW)) * stride;
+        // In burst mode port 0 counts the WHOLE transfer, so its address walks
+        // linearly. The interleaved form below spreads a per-port counter across the
+        // lanes; applying it here would scale the offset by NrMemPorts and every burst
+        // after the first would address the wrong words.
+        if (mem_use_port0_burst && (port == 0))
+          offset = mem_counter_q[port] * stride;
+        else
+          offset = ({mem_counter_q[port][$bits(vlen_t)-1:MAXEW] << $clog2(NrMemPorts), mem_counter_q[port][int'(MAXEW)-1:0]} + (port << MAXEW)) * stride;
       end
 
       addr                      = mem_spatz_req.rs1 + offset;
@@ -794,8 +802,39 @@ module spatz_vlsu
   ////////////////////
 
   // Store the offsets of all loads, for realigning
+  // Burst request state. One request on port 0 covers the whole transfer; every lane
+  // still reserves its share of the reorder-buffer ids, so all buffers advance together
+  // and a single base id describes the burst.
+  logic  [NrMemPorts-1:0]                    burst_mode_req;
+  logic  [NrMemPorts-1:0]                    burst_use;
+  logic  [NrMemPorts-1:0]                    burst_addr_aligned;
+  logic  [NrMemPorts-1:0][BurstLenWidth-1:0] burst_len_calc;
+  logic  [NrMemPorts-1:0][BurstLenWidth-1:0] burst_len_issue;
+  logic  [NrMemPorts-1:0]                    burst_alloc_q, burst_alloc_d;
+  logic  [NrMemPorts-1:0][BurstLenWidth-1:0] burst_len_q, burst_len_d;
+  logic  [NrMemPorts-1:0][BurstLenWidth-1:0] burst_alloc_cnt_q, burst_alloc_cnt_d;
+  id_t   [NrMemPorts-1:0]                    burst_base_id_q, burst_base_id_d;
+  logic  [NrMemPorts-1:0]                    burst_send;
+  logic  [NrMemPorts-1:0]                    burst_alloc_fire;
+  logic  [BurstLenWidth-1:0]                 burst_total_q, burst_total_d;
+  vlen_t [NrMemPorts-1:0]                    mem_max_elements;
+  vlen_t [NrMemPorts-1:0]                    mem_remaining_bytes;
+  vlen_t [NrMemPorts-1:0]                    mem_remaining_words;
+
+  logic exec_is_load;
+  assign exec_is_load = (state_q == VLSU_RunningLoad);
+
+  for (genvar port = 0; port < NrMemPorts; port++) begin : gen_burst_state
+    `FF(burst_alloc_q[port],     burst_alloc_d[port],     1'b0)
+    `FF(burst_len_q[port],       burst_len_d[port],       '0  )
+    `FF(burst_alloc_cnt_q[port], burst_alloc_cnt_d[port], '0  )
+    `FF(burst_base_id_q[port],   burst_base_id_d[port],   '0  )
+  end : gen_burst_state
+  `FF(burst_total_q, burst_total_d, '0)
+
   addr_offset_t [NrMemPorts-1:0] vreg_addr_offset;
   logic [NrMemPorts-1:0] offset_queue_full;
+  logic [NrMemPorts-1:0] offset_queue_empty;
   for (genvar port = 0; port < NrMemPorts; port++) begin : gen_offset_queue
     fifo_v3 #(
       .DATA_WIDTH(int'(MAXEW)       ),
@@ -805,13 +844,18 @@ module spatz_vlsu
       .rst_ni    (rst_ni                                                               ),
       .flush_i   (1'b0                                                                 ),
       .testmode_i(1'b0                                                                 ),
-      .empty_o   (/* Unused */                                                         ),
+      .empty_o   (offset_queue_empty[port]                                             ),
       .full_o    (offset_queue_full[port]                                              ),
-      .push_i    (spatz_mem_req_valid[port] && spatz_mem_req_ready[port] && mem_is_load),
+      // A burst is one request answered by many beats, so per-request offset tracking
+      // does not apply to it. Its addressing is linear and aligned, and the datapath
+      // derives each beat's offset directly.
+      .push_i    (spatz_mem_req_valid[port] && spatz_mem_req_ready[port] && mem_is_load &&
+                  !mem_use_port0_burst && !burst_use[port]                             ),
       .data_i    (mem_req_addr_offset[port]                                            ),
       .data_o    (vreg_addr_offset[port]                                               ),
+      // ...so its beats must not pop it either.
       .pop_i     (rob_pop[port] && commit_insn_q.is_load &&
-                  state_q == VLSU_RunningLoad              ),
+                  state_q == VLSU_RunningLoad && !offset_queue_empty[port]              ),
       .usage_o   (/* Unused */                                                         )
     );
   end: gen_offset_queue
@@ -1033,35 +1077,6 @@ module spatz_vlsu
 
   assign vd_elem_id = (commit_counter_q[0] > vreg_start_0) ? commit_counter_q[0] >> $clog2(ELENB) : commit_counter_q[N_FU-1] >> $clog2(ELENB);
 
-  // Burst request state. One request on port 0 covers the whole transfer; every lane
-  // still reserves its share of the reorder-buffer ids, so all buffers advance together
-  // and a single base id describes the burst.
-  logic  [NrMemPorts-1:0]                    burst_mode_req;
-  logic  [NrMemPorts-1:0]                    burst_use;
-  logic  [NrMemPorts-1:0]                    burst_addr_aligned;
-  logic  [NrMemPorts-1:0][BurstLenWidth-1:0] burst_len_calc;
-  logic  [NrMemPorts-1:0][BurstLenWidth-1:0] burst_len_issue;
-  logic  [NrMemPorts-1:0]                    burst_alloc_q, burst_alloc_d;
-  logic  [NrMemPorts-1:0][BurstLenWidth-1:0] burst_len_q, burst_len_d;
-  logic  [NrMemPorts-1:0][BurstLenWidth-1:0] burst_alloc_cnt_q, burst_alloc_cnt_d;
-  id_t   [NrMemPorts-1:0]                    burst_base_id_q, burst_base_id_d;
-  logic  [NrMemPorts-1:0]                    burst_send;
-  logic  [NrMemPorts-1:0]                    burst_alloc_fire;
-  logic  [BurstLenWidth-1:0]                 burst_total_q, burst_total_d;
-  vlen_t [NrMemPorts-1:0]                    mem_max_elements;
-  vlen_t [NrMemPorts-1:0]                    mem_remaining_bytes;
-  vlen_t [NrMemPorts-1:0]                    mem_remaining_words;
-
-  logic exec_is_load;
-  assign exec_is_load = (state_q == VLSU_RunningLoad);
-
-  for (genvar port = 0; port < NrMemPorts; port++) begin : gen_burst_state
-    `FF(burst_alloc_q[port],     burst_alloc_d[port],     1'b0)
-    `FF(burst_len_q[port],       burst_len_d[port],       '0  )
-    `FF(burst_alloc_cnt_q[port], burst_alloc_cnt_d[port], '0  )
-    `FF(burst_base_id_q[port],   burst_base_id_d[port],   '0  )
-  end : gen_burst_state
-  `FF(burst_total_q, burst_total_d, '0)
 
   for (genvar port = 0; port < NrMemPorts; port++) begin: gen_mem_counter_proc
     // The total amount of elements we have to work through
@@ -1226,14 +1241,27 @@ module spatz_vlsu
     for (int port = 0; port < NrMemPorts; port++) begin
       mem_pending[port] = mem_pending_q[port] != '0;
 
-      // New request sent
-      if (mem_is_load && spatz_mem_req_valid[port] && spatz_mem_req_ready[port])
-        mem_pending_d[port]++;
+      // New request sent. A burst is ONE request on port 0 that returns beats to every
+      // buffer, so it owes each lane its share -- not the whole length to port 0, which
+      // would leave the other lanes reading "owes nothing" and dropping their beats.
+      // The charge keys on the REQUEST, not the mode: a one-word request issued while in
+      // burst mode owes a share only where that word lands.
+      if (mem_use_port0_burst) begin
+        if (mem_is_load && spatz_mem_req_valid[0] && spatz_mem_req_ready[0] && mem_req_lvalid[0])
+          mem_pending_d[port] = mem_pending_d[port] +
+                                burst_port_share(spatz_mem_req[0].burst_len, port);
+      end else if (mem_is_load && spatz_mem_req_valid[port] && spatz_mem_req_ready[port]) begin
+        mem_pending_d[port] = mem_pending_d[port] + spatz_mem_req[port].burst_len;
+      end
 
       // Response used. RunningLoad-gated so the store-leftover drain (which
       // can fire in the load branch while still in RunningStore) never
       // decrements a counter that only tracks load responses (underflow).
-      if (commit_insn_q.is_load && state_q == VLSU_RunningLoad && rob_rvalid[port] && rob_pop[port])
+      // A dummy was never charged -- the charge counts a request's real beats -- so
+      // letting its drain decrement here would break one-charge-one-decrement and the
+      // counter would read zero with beats still owed.
+      if (commit_insn_q.is_load && state_q == VLSU_RunningLoad && rob_rvalid[port] &&
+          rob_pop[port] && !rob_dummy[port] && (mem_pending_q[port] != '0))
         mem_pending_d[port]--;
     end
   end
@@ -1756,8 +1784,9 @@ module spatz_vlsu
     assign spatz_mem_req[port].mode  = '0; // Request always uses user privilege level
     assign spatz_mem_req[port].size  = mem_spatz_req.vtype.vsew[1:0];
     assign spatz_mem_req[port].write = !mem_is_load;
-    // Zero is the single-word request the integration's burst adapter passes through.
-    assign spatz_mem_req[port].burst_len = burst_use[port] ? burst_len_issue[port] : '0;
+    // One is the single-word request the integration's burst adapter passes through.
+    assign spatz_mem_req[port].burst_len = (mem_req_lvalid[port] && burst_send[port])
+                                         ? burst_len_issue[port] : BurstLenWidth'(1);
     assign spatz_mem_req[port].strb  = mem_req_strb[port];
     assign spatz_mem_req[port].data  = mem_req_data[port];
     assign spatz_mem_req[port].last  = mem_req_last[port];
